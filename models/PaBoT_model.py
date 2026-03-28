@@ -254,7 +254,9 @@ class PaBoTModel(BaseModel):
     
         for id, feats in enumerate(features):
             x_d1, x_d2 = torch.chunk(feats, 2, dim=0)
-            jacobian = (x_d1 - x_d2) / (torch.maximum(d1 - d2, torch.ones_like(d1)*0.1))
+            # d1/d2 are [B]; reshape to [B,1,1,1] for safe broadcast over [B,C,H,W] features.
+            delta_d = torch.maximum(d1 - d2, torch.ones_like(d1) * 0.1).view(-1, 1, 1, 1)
+            jacobian = (x_d1 - x_d2) / delta_d
             if use_bone_guidance:
                 cams = torch.nn.functional.interpolate(cam, size=x_d1.shape[2:], mode='bilinear')
                 energy = ((1 + self.opt.lambda_a * cams) * (jacobian ** 2)).mean()
