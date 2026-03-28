@@ -11,14 +11,27 @@ import os
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
+    num_gpus = len(opt.gpu_ids)
+    if num_gpus > 1 and opt.batch_size < num_gpus:
+        raise ValueError(
+            'For multi-GPU DataParallel, --batch_size must be >= number of GPUs. '
+            f'Got batch_size={opt.batch_size}, num_gpus={num_gpus}.'
+        )
+    if num_gpus > 1 and opt.batch_size % num_gpus != 0:
+        print(
+            f'Warning: batch_size ({opt.batch_size}) is not divisible by num_gpus ({num_gpus}). '
+            'Per-GPU load may be imbalanced.'
+        )
+    device = torch.device(f'cuda:{opt.gpu_ids[0]}') if num_gpus > 0 else torch.device('cpu')
+
     dataset = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
     dataset_size = len(dataset)    # get the number of images in the dataset.
     test_loader_a, test_loader_b = get_test_loaders(opt)
     val_loader_a, val_loader_b = get_val_loaders(opt)
     # 修改选取逻辑
     chosen_ids = [50, 100, 150, 200] 
-    fix_a = torch.stack([test_loader_a.dataset[i]['A'] for i in chosen_ids[:opt.display_size]]).cuda()
-    fix_b = torch.stack([test_loader_b.dataset[i]['A'] for i in chosen_ids[:opt.display_size]]).cuda()
+    fix_a = torch.stack([test_loader_a.dataset[i]['A'] for i in chosen_ids[:opt.display_size]]).to(device)
+    fix_b = torch.stack([test_loader_b.dataset[i]['A'] for i in chosen_ids[:opt.display_size]]).to(device)
     # fix_a = torch.stack([test_loader_a.dataset[i]['A'] for i in range(opt.display_size)]).cuda()  # fixed test data
     # fix_b = torch.stack([test_loader_b.dataset[i]['A'] for i in range(opt.display_size)]).cuda()
     #print(fix_a.shape,fix_a.size(0)) torch.Size([16, 3, 256, 256]) 16
@@ -33,7 +46,7 @@ if __name__ == '__main__':
     # LPIPS model (initialize once)
     try:
         import lpips
-        lpips_fn = lpips.LPIPS(net='alex').cuda()
+        lpips_fn = lpips.LPIPS(net='alex').to(device)
     except ImportError:
         print('Warning: lpips not installed, LPIPS will be skipped. Install with: pip install lpips')
         lpips_fn = None
@@ -63,7 +76,8 @@ if __name__ == '__main__':
             if epoch == opt.epoch_count and i == 0:
                 model.data_dependent_initialize(data)
                 model.setup(opt)               # regular setup: load and print networks; create schedulers
-                model.parallelize()
+                if num_gpus > 1:
+                    model.parallelize()
             model.set_input(data)  # unpack data from dataset and apply preprocessing
             model.optimize_parameters()   # calculate loss functions, get gradients, update network weights
             if len(opt.gpu_ids) > 0:
