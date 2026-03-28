@@ -271,7 +271,8 @@ class PaBoTModel(BaseModel):
     # Path visualization for Fig. 6 with θ = 0.2
     @torch.no_grad()
     def interpolation(self, x_a, x_b):
-        self.netG.eval()
+        netG = self.netG.module if isinstance(self.netG, torch.nn.DataParallel) else self.netG
+        netG.eval()
         if self.opt.direction == 'AtoB':
             x = x_a
         else:
@@ -279,42 +280,44 @@ class PaBoTModel(BaseModel):
         interps = []
         
         for i in range(min(x.size(0),2)):
-            h_a = self.netG(x[i].unsqueeze(0), mode='encode')
+            h_a = netG(x[i].unsqueeze(0), mode='encode')
             d = 0
             local_interps = []
             #local_interps.append(x[i].unsqueeze(0))
 
             while d <= 1:
                 d_t = torch.tensor([d]).to(x_a.device).unsqueeze(-1)
-                local_interps.append(self.netG((h_a, d_t), mode='decode'))
+                local_interps.append(netG((h_a, d_t), mode='decode'))
                 d += 0.2
             local_interps = torch.cat(local_interps, 0)
             interps.append(local_interps)
-        self.netG.train()
+        netG.train()
         return interps
 
     # Only infer/generate the target domain image
     @torch.no_grad()
     def translate(self, x):
-        self.netG.eval()
-        h = self.netG(x, mode='encode')
-        out = self.netG((h, self.d_B), mode='decode')
-        self.netG.train()
+        netG = self.netG.module if isinstance(self.netG, torch.nn.DataParallel) else self.netG
+        netG.eval()
+        h = netG(x, mode='encode')
+        out = netG((h, self.d_B), mode='decode')
+        netG.train()
         return out
 
     @torch.no_grad()
     def sample(self, x_a, x_b):
-        self.netG.eval()
+        netG = self.netG.module if isinstance(self.netG, torch.nn.DataParallel) else self.netG
+        netG.eval()
         if self.opt.direction == 'BtoA':
             x_a, x_b = x_b, x_a
         x_a_recon, x_b_recon, x_ba, x_ab = [], [], [], []
         for i in range(x_a.size(0)):
-            h_a = self.netG(x_a[i].unsqueeze(0), mode='encode')
-            h_b = self.netG(x_b[i].unsqueeze(0), mode='encode')
-            x_a_recon.append(self.netG((h_a, self.d_A), mode='decode'))
-            x_b_recon.append(self.netG((h_b, self.d_B), mode='decode'))
-            x_ab.append(self.netG((h_a, self.d_B), mode='decode'))
+            h_a = netG(x_a[i].unsqueeze(0), mode='encode')
+            h_b = netG(x_b[i].unsqueeze(0), mode='encode')
+            x_a_recon.append(netG((h_a, self.d_A), mode='decode'))
+            x_b_recon.append(netG((h_b, self.d_B), mode='decode'))
+            x_ab.append(netG((h_a, self.d_B), mode='decode'))
         x_a_recon, x_b_recon = torch.cat(x_a_recon), torch.cat(x_b_recon)
         x_ab = torch.cat(x_ab)
-        self.netG.train()
+        netG.train()
         return x_a, x_a_recon, x_ab, x_b, x_b_recon
