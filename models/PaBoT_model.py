@@ -159,7 +159,11 @@ class PaBoTModel(BaseModel):
             self.mu = latents
             latents = latents + noise
         self.latent_A, self.latent_B = latents.chunk(2, dim=0)
-        ds = torch.cat([self.d_A, self.d_B, self.d_B], 0).unsqueeze(-1)
+        # Build per-sample domain codes so DataParallel can scatter decode inputs consistently.
+        batch_size = self.latent_A.size(0)
+        d_A = torch.zeros(batch_size, device=self.device)
+        d_B = torch.ones(batch_size, device=self.device)
+        ds = torch.cat([d_A, d_A, d_B], 0).unsqueeze(-1)
         latents = torch.cat([self.latent_A, self.latent_A, self.latent_B], 0)
         images = self.netG((latents, ds), mode='decode')
         self.rec_A, self.fake_B, self.idt_B = images.chunk(3, dim=0)
