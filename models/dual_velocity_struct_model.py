@@ -87,11 +87,7 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--ode_steps", type=int, default=8, help="number of unfolding steps")
         parser.add_argument("--warmup_epochs", type=int, default=10, help="warmup epochs without structure guidance")
         parser.add_argument("--struct_channels", type=int, default=64, help="structure feature channels for net_A")
-        parser.add_argument("--gen_backbone", type=str, default="latent_velocity",
-                            choices=["latent_velocity", "adain_resnet_9blocks"],
-                            help="backbone for velocity generator net_Gen")
-        parser.add_argument("--gen_ngf", type=int, default=64, help="ngf used when gen_backbone is adain_resnet_9blocks")
-        parser.add_argument("--vgen_scale", type=float, default=1.0, help="scale factor applied to v_g prediction")
+        parser.add_argument("--vgen_scale", type=float, default=1.0, help="scale factor applied to latent v_g prediction")
         parser.add_argument("--log_attention_map", type=util.str2bool, nargs="?", const=True, default=True,
                             help="log structure attention map in visual outputs")
         parser.add_argument("--use_structure_attention", type=util.str2bool, nargs="?", const=True, default=True,
@@ -156,28 +152,12 @@ class DualVelocityStructModel(BaseModel):
         latent_channels = self._infer_latent_channels()
         struct_channels = max(1, int(opt.struct_channels))
 
-        if opt.gen_backbone == "adain_resnet_9blocks":
-            self.netGen = networks.define_G(
-                latent_channels,
-                latent_channels,
-                opt.gen_ngf,
-                "adain_resnet_9blocks",
-                opt.normG,
-                not opt.no_dropout,
-                opt.init_type,
-                opt.init_gain,
-                opt.no_antialias,
-                opt.no_antialias_up,
-                self.gpu_ids,
-                opt,
-            )
-        else:
-            self.netGen = networks.init_net(
-                LatentVelocityNet(latent_channels, hidden_channels=max(64, opt.ngf * 2)),
-                opt.init_type,
-                opt.init_gain,
-                self.gpu_ids,
-            )
+        self.netGen = networks.init_net(
+            LatentVelocityNet(latent_channels, hidden_channels=max(64, opt.ngf * 2)),
+            opt.init_type,
+            opt.init_gain,
+            self.gpu_ids,
+        )
         self.netA = networks.init_net(
             StructureFeatureExtractor(latent_channels, struct_channels),
             opt.init_type,
@@ -296,12 +276,7 @@ class DualVelocityStructModel(BaseModel):
 
     def _predict_v_g(self, latents, t_tensor, net_gen=None):
         net_gen = self.netGen if net_gen is None else net_gen
-        if self.opt.gen_backbone == "adain_resnet_9blocks":
-            v_g = net_gen((latents, t_tensor.unsqueeze(-1)), mode="decode")
-        else:
-            v_g = net_gen(latents, t_tensor)
-        if v_g.shape[-2:] != latents.shape[-2:]:
-            v_g = F.interpolate(v_g, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+        v_g = net_gen(latents, t_tensor)
         return v_g * float(self.opt.vgen_scale)
 
     def inference(self, latents_A, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):

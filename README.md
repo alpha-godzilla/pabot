@@ -77,13 +77,11 @@ python train.py \
 ```
 
 ```bash
-# Parameter-aligned variant: use AdaIN-ResNet-9blocks as velocity generator
+# Latent-ODE structural guidance variant
 python train.py \
   --dataroot ./datasets/Head \
   --direction BtoA \
   --model dual_velocity_struct \
-  --gen_backbone adain_resnet_9blocks \
-  --gen_ngf 64 \
   --struct_channels 64 \
   --log_attention_map true \
   --controlled_pairing true \
@@ -93,7 +91,7 @@ python train.py \
   --lambda_pair 1.0 \
   --lambda_vs 0.01 \
   --lambda_ortho 0.01 \
-  --tag dual_velocity_struct_adain_gen
+  --tag dual_velocity_struct_latent
 ```
 
 ```bash
