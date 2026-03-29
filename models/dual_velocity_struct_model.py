@@ -300,6 +300,8 @@ class DualVelocityStructModel(BaseModel):
             v_g = net_gen((latents, t_tensor.unsqueeze(-1)), mode="decode")
         else:
             v_g = net_gen(latents, t_tensor)
+        if v_g.shape[-2:] != latents.shape[-2:]:
+            v_g = F.interpolate(v_g, size=latents.shape[-2:], mode="bilinear", align_corners=False)
         return v_g * float(self.opt.vgen_scale)
 
     def inference(self, latents_A, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
