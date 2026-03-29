@@ -77,6 +77,26 @@ python train.py \
 ```
 
 ```bash
+# Parameter-aligned variant: use AdaIN-ResNet-9blocks as velocity generator
+python train.py \
+  --dataroot ./datasets/Head \
+  --direction BtoA \
+  --model dual_velocity_struct \
+  --gen_backbone adain_resnet_9blocks \
+  --gen_ngf 64 \
+  --struct_channels 64 \
+  --log_attention_map true \
+  --controlled_pairing true \
+  --paired_ratio 0.1 \
+  --warmup_epochs 10 \
+  --lambda_path 0.1 \
+  --lambda_pair 1.0 \
+  --lambda_vs 0.01 \
+  --lambda_ortho 0.01 \
+  --tag dual_velocity_struct_adain_gen
+```
+
+```bash
 # Multi-GPU example (DataParallel)
 python train.py \
   --dataroot ./datasets/Head \

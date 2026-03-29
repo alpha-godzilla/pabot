@@ -86,7 +86,14 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--style_dim", type=int, default=8, help="style code dimensionality for AdaIN decoder")
         parser.add_argument("--ode_steps", type=int, default=8, help="number of unfolding steps")
         parser.add_argument("--warmup_epochs", type=int, default=10, help="warmup epochs without structure guidance")
-        parser.add_argument("--struct_channels", type=int, default=0, help="structure feature channels, 0 means latent channels")
+        parser.add_argument("--struct_channels", type=int, default=64, help="structure feature channels for net_A")
+        parser.add_argument("--gen_backbone", type=str, default="latent_velocity",
+                            choices=["latent_velocity", "adain_resnet_9blocks"],
+                            help="backbone for velocity generator net_Gen")
+        parser.add_argument("--gen_ngf", type=int, default=64, help="ngf used when gen_backbone is adain_resnet_9blocks")
+        parser.add_argument("--vgen_scale", type=float, default=1.0, help="scale factor applied to v_g prediction")
+        parser.add_argument("--log_attention_map", type=util.str2bool, nargs="?", const=True, default=True,
+                            help="log structure attention map in visual outputs")
         parser.add_argument("--use_structure_attention", type=util.str2bool, nargs="?", const=True, default=True,
                             help="enable structure attention branch in non-warmup phases")
         parser.add_argument("--tag", type=str, default="dual_velocity_struct", help="experiment tag")
@@ -123,6 +130,8 @@ class DualVelocityStructModel(BaseModel):
             "G_total",
         ]
         self.visual_names = ["real_A", "fake_B", "real_B"]
+        if opt.log_attention_map:
+            self.visual_names.append("attn_map")
 
         if self.isTrain:
             self.model_names = ["G", "Gen", "A", "VStruct", "D"]
@@ -145,14 +154,30 @@ class DualVelocityStructModel(BaseModel):
         )
 
         latent_channels = self._infer_latent_channels()
-        struct_channels = opt.struct_channels if opt.struct_channels > 0 else latent_channels
+        struct_channels = max(1, int(opt.struct_channels))
 
-        self.netGen = networks.init_net(
-            LatentVelocityNet(latent_channels, hidden_channels=max(64, opt.ngf * 2)),
-            opt.init_type,
-            opt.init_gain,
-            self.gpu_ids,
-        )
+        if opt.gen_backbone == "adain_resnet_9blocks":
+            self.netGen = networks.define_G(
+                latent_channels,
+                latent_channels,
+                opt.gen_ngf,
+                "adain_resnet_9blocks",
+                opt.normG,
+                not opt.no_dropout,
+                opt.init_type,
+                opt.init_gain,
+                opt.no_antialias,
+                opt.no_antialias_up,
+                self.gpu_ids,
+                opt,
+            )
+        else:
+            self.netGen = networks.init_net(
+                LatentVelocityNet(latent_channels, hidden_channels=max(64, opt.ngf * 2)),
+                opt.init_type,
+                opt.init_gain,
+                self.gpu_ids,
+            )
         self.netA = networks.init_net(
             StructureFeatureExtractor(latent_channels, struct_channels),
             opt.init_type,
@@ -240,6 +265,18 @@ class DualVelocityStructModel(BaseModel):
         return self.netG((latents, domain), mode="decode")
 
     @staticmethod
+    def _unwrap_module(net):
+        return net.module if isinstance(net, torch.nn.DataParallel) else net
+
+    def _build_attention_map(self, latent_A):
+        with torch.no_grad():
+            feat = self.netA(latent_A)
+            attn = feat.abs().mean(dim=1, keepdim=True)
+            attn = F.interpolate(attn, size=self.real_A.shape[2:], mode="bilinear", align_corners=False)
+            attn = attn / (attn.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6))
+            return attn * 2.0 - 1.0
+
+    @staticmethod
     def _set_trainable(net, flag):
         for param in net.parameters():
             param.requires_grad = flag
@@ -257,24 +294,36 @@ class DualVelocityStructModel(BaseModel):
         latent_A, latent_B = latents.chunk(2, dim=0)
         return latent_A, latent_B, mu
 
-    def inference(self, latents_A, use_structure=True, detach_vg=False):
+    def _predict_v_g(self, latents, t_tensor, net_gen=None):
+        net_gen = self.netGen if net_gen is None else net_gen
+        if self.opt.gen_backbone == "adain_resnet_9blocks":
+            v_g = net_gen((latents, t_tensor.unsqueeze(-1)), mode="decode")
+        else:
+            v_g = net_gen(latents, t_tensor)
+        return v_g * float(self.opt.vgen_scale)
+
+    def inference(self, latents_A, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
         latents = latents_A
         num_steps = max(1, int(self.opt.ode_steps))
         dt = 1.0 / num_steps
 
-        S_0 = self.netA(latents_A) if (use_structure and self.opt.use_structure_attention) else None
+        net_gen = self.netGen if net_gen is None else net_gen
+        net_a = self.netA if net_a is None else net_a
+        net_v_struct = self.netVStruct if net_v_struct is None else net_v_struct
+
+        S_0 = net_a(latents_A) if (use_structure and self.opt.use_structure_attention) else None
         v_gen_history = []
         v_struct_history = []
 
         for step in range(num_steps):
             t_val = float(step) / num_steps
             t_tensor = torch.full((latents.shape[0],), t_val, device=latents.device, dtype=latents.dtype)
-            v_g = self.netGen(latents, t_tensor)
+            v_g = self._predict_v_g(latents, t_tensor, net_gen=net_gen)
             if detach_vg:
                 v_g = v_g.detach()
 
             if S_0 is not None:
-                v_s = self.netVStruct(torch.cat([latents, S_0], dim=1), t_tensor)
+                v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_tensor)
             else:
                 v_s = torch.zeros_like(v_g)
 
@@ -285,6 +334,39 @@ class DualVelocityStructModel(BaseModel):
         v_gen_stacked = torch.stack(v_gen_history, dim=0)
         v_struct_stacked = torch.stack(v_struct_history, dim=0)
         return latents, v_gen_stacked, v_struct_stacked
+
+    def _integrate_latent_async_for_vis(self, latent, steps, net_gen=None, net_a=None, net_v_struct=None):
+        """
+        Asynchronous integration for visualization:
+        use different time inputs for v_g and v_s, then decode after integration.
+        """
+        latents = latent
+        dt = 1.0 / max(1, steps)
+        net_gen = self.netGen if net_gen is None else net_gen
+        net_a = self.netA if net_a is None else net_a
+        net_v_struct = self.netVStruct if net_v_struct is None else net_v_struct
+        S_0 = net_a(latent) if self.opt.use_structure_attention else None
+
+        states = [latents]
+        for step in range(steps):
+            t_g = float(step) / steps
+            # Half-step phase shift for structural velocity, making two fields asynchronous.
+            t_s = (float(step) + 0.5) / steps
+            if t_s >= 1.0:
+                t_s -= 1.0
+
+            t_g_tensor = torch.full((latents.shape[0],), t_g, device=latents.device, dtype=latents.dtype)
+            t_s_tensor = torch.full((latents.shape[0],), t_s, device=latents.device, dtype=latents.dtype)
+
+            v_g = self._predict_v_g(latents, t_g_tensor, net_gen=net_gen)
+            if S_0 is not None:
+                v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_s_tensor)
+            else:
+                v_s = torch.zeros_like(v_g)
+
+            latents = latents + (v_g + v_s) * dt
+            states.append(latents)
+        return states
 
     def _path_penalty(self, v_gen_hist, v_struct_hist):
         return (v_gen_hist + v_struct_hist).square().mean()
@@ -397,6 +479,8 @@ class DualVelocityStructModel(BaseModel):
         self.fake_B = self._decode(latents_fake, domain_value=1.0)
         self.rec_A = self._decode(latent_A, domain_value=0.0)
         self.idt_B = self._decode(latent_B, domain_value=1.0)
+        if self.opt.log_attention_map:
+            self.attn_map = self._build_attention_map(latent_A)
 
     def optimize_parameters(self):
         self._init_loss_tensors()
@@ -421,6 +505,10 @@ class DualVelocityStructModel(BaseModel):
             self.loss_G_ortho = result["loss_G_ortho"]
             self.loss_G_pair = result["loss_G_pair"]
             self.loss_G_total = result["loss_G_total"]
+            if self.opt.log_attention_map:
+                with torch.no_grad():
+                    latent_A_vis, _, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
+                    self.attn_map = self._build_attention_map(latent_A_vis)
             return
 
         paired_mask = self.is_paired
@@ -462,6 +550,10 @@ class DualVelocityStructModel(BaseModel):
             self.fake_B = fake_for_visual
             self.rec_A = self.real_A.detach()
             self.idt_B = self.real_B.detach()
+            if self.opt.log_attention_map:
+                with torch.no_grad():
+                    latent_A_vis, _, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
+                    self.attn_map = self._build_attention_map(latent_A_vis)
 
     @torch.no_grad()
     def translate(self, x, *_unused):
@@ -471,9 +563,15 @@ class DualVelocityStructModel(BaseModel):
         self.netA.eval()
         self.netVStruct.eval()
 
-        latent = self.netG(x, mode="encode")
-        latents_fake, _, _ = self.inference(latent, use_structure=True)
-        out = self._decode(latents_fake, domain_value=1.0)
+        netG = self._unwrap_module(self.netG)
+        netGen = self._unwrap_module(self.netGen)
+        netA = self._unwrap_module(self.netA)
+        netVStruct = self._unwrap_module(self.netVStruct)
+
+        latent = netG(x, mode="encode")
+        latents_fake, _, _ = self.inference(latent, use_structure=True, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+        domain = torch.full((latents_fake.size(0), 1), 1.0, device=latents_fake.device, dtype=latents_fake.dtype)
+        out = netG((latents_fake, domain), mode="decode")
 
         if was_training:
             self.netG.train()
@@ -493,23 +591,21 @@ class DualVelocityStructModel(BaseModel):
         self.netGen.eval()
         self.netA.eval()
         self.netVStruct.eval()
+        netG = self._unwrap_module(self.netG)
+        netGen = self._unwrap_module(self.netGen)
+        netA = self._unwrap_module(self.netA)
+        netVStruct = self._unwrap_module(self.netVStruct)
 
         interps = []
         for i in range(min(x.size(0), 2)):
-            latent = self.netG(x[i].unsqueeze(0), mode="encode")
-            latents = latent
-            snaps = [self._decode(latents, domain_value=1.0)]
+            latent = netG(x[i].unsqueeze(0), mode="encode")
             steps = max(1, int(self.opt.ode_steps))
-            dt = 1.0 / steps
-            S_0 = self.netA(latent)
-            for step in range(steps):
-                t_val = float(step) / steps
-                t_tensor = torch.full((1,), t_val, device=latents.device, dtype=latents.dtype)
-                v_g = self.netGen(latents, t_tensor)
-                v_s = self.netVStruct(torch.cat([latents, S_0], dim=1), t_tensor)
-                latents = latents + (v_g + v_s) * dt
-                if (step + 1) % max(1, steps // 5) == 0 or step == steps - 1:
-                    snaps.append(self._decode(latents, domain_value=1.0))
+            states = self._integrate_latent_async_for_vis(latent, steps, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+            picks = torch.linspace(0, len(states) - 1, steps=6).long().tolist()
+            snaps = []
+            for idx in picks:
+                domain = torch.full((states[idx].size(0), 1), 1.0, device=states[idx].device, dtype=states[idx].dtype)
+                snaps.append(netG((states[idx], domain), mode="decode"))
             interps.append(torch.cat(snaps, dim=0))
 
         self.netG.train()
@@ -524,6 +620,10 @@ class DualVelocityStructModel(BaseModel):
         self.netGen.eval()
         self.netA.eval()
         self.netVStruct.eval()
+        netG = self._unwrap_module(self.netG)
+        netGen = self._unwrap_module(self.netGen)
+        netA = self._unwrap_module(self.netA)
+        netVStruct = self._unwrap_module(self.netVStruct)
 
         if self.opt.direction == "BtoA":
             x_a, x_b = x_b, x_a
@@ -532,12 +632,15 @@ class DualVelocityStructModel(BaseModel):
         x_b_recon = []
         x_ab = []
         for i in range(x_a.size(0)):
-            h_a = self.netG(x_a[i].unsqueeze(0), mode="encode")
-            h_b = self.netG(x_b[i].unsqueeze(0), mode="encode")
-            x_a_recon.append(self._decode(h_a, domain_value=0.0))
-            x_b_recon.append(self._decode(h_b, domain_value=1.0))
-            h_ab, _, _ = self.inference(h_a, use_structure=True)
-            x_ab.append(self._decode(h_ab, domain_value=1.0))
+            h_a = netG(x_a[i].unsqueeze(0), mode="encode")
+            h_b = netG(x_b[i].unsqueeze(0), mode="encode")
+            d0 = torch.full((h_a.size(0), 1), 0.0, device=h_a.device, dtype=h_a.dtype)
+            d1 = torch.full((h_b.size(0), 1), 1.0, device=h_b.device, dtype=h_b.dtype)
+            x_a_recon.append(netG((h_a, d0), mode="decode"))
+            x_b_recon.append(netG((h_b, d1), mode="decode"))
+            h_ab, _, _ = self.inference(h_a, use_structure=True, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+            d1_ab = torch.full((h_ab.size(0), 1), 1.0, device=h_ab.device, dtype=h_ab.dtype)
+            x_ab.append(netG((h_ab, d1_ab), mode="decode"))
 
         x_a_recon = torch.cat(x_a_recon)
         x_b_recon = torch.cat(x_b_recon)
