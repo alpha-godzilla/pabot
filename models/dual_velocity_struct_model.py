@@ -28,6 +28,68 @@ class StructureFeatureExtractor(nn.Module):
         return self.net(x)
 
 
+class ViTEncoderBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True, dropout=0.0)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        attn_out, attn_w = self.attn(x_norm, x_norm, x_norm, need_weights=True, average_attn_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x, attn_w
+
+
+class LatentViTFeatureExtractor(nn.Module):
+    def __init__(self, in_channels, out_channels, embed_dim=256, depth=4, num_heads=8, patch_size=2):
+        super().__init__()
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.blocks = nn.ModuleList([ViTEncoderBlock(embed_dim=embed_dim, num_heads=num_heads) for _ in range(depth)])
+        self.proj = nn.Conv2d(embed_dim, out_channels, kernel_size=1)
+        self.last_attn_map = None
+
+    def forward(self, x):
+        b, _, h, w = x.shape
+        tokens_2d = self.patch_embed(x)
+        hp, wp = tokens_2d.shape[2], tokens_2d.shape[3]
+        tokens = tokens_2d.flatten(2).transpose(1, 2)
+
+        last_attn = None
+        for block in self.blocks:
+            tokens, attn_w = block(tokens)
+            last_attn = attn_w
+
+        if last_attn is not None:
+            # last_attn: [B, heads, N, N], convert to token saliency over keys.
+            token_score = last_attn.mean(dim=1).mean(dim=1)
+            attn_2d = token_score.view(b, 1, hp, wp)
+            if attn_2d.shape[-2:] != (h, w):
+                attn_2d = F.interpolate(attn_2d, size=(h, w), mode="bilinear", align_corners=False)
+            attn_2d = attn_2d - attn_2d.amin(dim=(2, 3), keepdim=True)
+            attn_2d = attn_2d / attn_2d.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+            self.last_attn_map = attn_2d
+        else:
+            self.last_attn_map = None
+
+        tokens_2d = tokens.transpose(1, 2).reshape(b, -1, hp, wp)
+        feat = self.proj(tokens_2d)
+        if feat.shape[-2:] != (h, w):
+            feat = F.interpolate(feat, size=(h, w), mode="bilinear", align_corners=False)
+        return feat
+
+    def get_last_attention_map(self):
+        return self.last_attn_map
+
+
 class StructureVelocityGenerator(nn.Module):
     def __init__(self, in_channels, out_channels, hidden_channels=128, time_dim=64):
         super().__init__()
@@ -87,6 +149,12 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--ode_steps", type=int, default=8, help="number of unfolding steps")
         parser.add_argument("--warmup_epochs", type=int, default=10, help="warmup epochs without structure guidance")
         parser.add_argument("--struct_channels", type=int, default=64, help="structure feature channels for net_A")
+        parser.add_argument("--a_backbone", type=str, default="cnn", choices=["cnn", "vit", "dit"],
+                            help="backbone for structure feature extractor net_A")
+        parser.add_argument("--a_vit_dim", type=int, default=256, help="embed dim for ViT-based net_A")
+        parser.add_argument("--a_vit_depth", type=int, default=4, help="encoder depth for ViT-based net_A")
+        parser.add_argument("--a_vit_heads", type=int, default=8, help="attention heads for ViT-based net_A")
+        parser.add_argument("--a_vit_patch", type=int, default=2, help="patch size for ViT-based net_A")
         parser.add_argument("--vgen_scale", type=float, default=1.0, help="scale factor applied to latent v_g prediction")
         parser.add_argument("--log_attention_map", type=util.str2bool, nargs="?", const=True, default=True,
                             help="log structure attention map in visual outputs")
@@ -158,8 +226,19 @@ class DualVelocityStructModel(BaseModel):
             opt.init_gain,
             self.gpu_ids,
         )
+        if opt.a_backbone in {"vit", "dit"}:
+            net_a = LatentViTFeatureExtractor(
+                latent_channels,
+                struct_channels,
+                embed_dim=opt.a_vit_dim,
+                depth=opt.a_vit_depth,
+                num_heads=opt.a_vit_heads,
+                patch_size=opt.a_vit_patch,
+            )
+        else:
+            net_a = StructureFeatureExtractor(latent_channels, struct_channels)
         self.netA = networks.init_net(
-            StructureFeatureExtractor(latent_channels, struct_channels),
+            net_a,
             opt.init_type,
             opt.init_gain,
             self.gpu_ids,
@@ -250,8 +329,14 @@ class DualVelocityStructModel(BaseModel):
 
     def _build_attention_map(self, latent_A):
         with torch.no_grad():
-            feat = self.netA(latent_A)
-            attn = feat.abs().mean(dim=1, keepdim=True)
+            net_a = self._unwrap_module(self.netA)
+            feat = net_a(latent_A)
+            if hasattr(net_a, "get_last_attention_map"):
+                attn = net_a.get_last_attention_map()
+            else:
+                attn = None
+            if attn is None:
+                attn = feat.abs().mean(dim=1, keepdim=True)
             attn = F.interpolate(attn, size=self.real_A.shape[2:], mode="bilinear", align_corners=False)
             attn = attn / (attn.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6))
             return attn * 2.0 - 1.0
