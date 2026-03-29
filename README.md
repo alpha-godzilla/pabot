@@ -30,12 +30,80 @@ For reference, we also provide partial examples of the [Head dataset](datasets/H
 
 ```bash
 # Train the model
-python train.py --dataroot=./datasets/Head --direction=BtoA --lambda_path=0.1 --tag=PaBoT
+python train.py --dataroot=./datasets/Head --direction=BtoA --model dual_velocity --lambda_struct=0.1 --lambda_kin=0.1 --tag=dual_velocity
 
 # Test the model
 # Make sure to place the trained checkpoints in `checkpoints/Head`
 python test.py --dataroot=./datasets/Head --name=Head --direction=BtoA --num_test 2250 --epoch 100
 ```
+
+### Minimal Training Commands
+
+```bash
+# Single-GPU minimal run (recommended first sanity check)
+python train.py \
+  --dataroot ./datasets/Head \
+  --direction BtoA \
+  --model dual_velocity \
+  --batch_size 2 \
+  --ode_steps 8 \
+  --ss_steps 7 \
+  --lambda_GAN 1.0 \
+  --lambda_rec 5.0 \
+  --lambda_idt 5.0 \
+  --lambda_kl 0.01 \
+  --lambda_struct 0.10 \
+  --lambda_kin 0.10 \
+  --noise_std 1.0 \
+  --ode_solver euler \
+  --tag dual_velocity
+```
+
+```bash
+# Controlled pairing + alternating structure guidance (new compatible variant)
+python train.py \
+  --dataroot ./datasets/Head \
+  --direction BtoA \
+  --model dual_velocity_struct \
+  --controlled_pairing true \
+  --paired_ratio 0.1 \
+  --pair_seed 3407 \
+  --warmup_epochs 10 \
+  --lambda_path 0.1 \
+  --lambda_pair 1.0 \
+  --lambda_vs 0.01 \
+  --lambda_ortho 0.01 \
+  --tag dual_velocity_struct
+```
+
+```bash
+# Multi-GPU example (DataParallel)
+python train.py \
+  --dataroot ./datasets/Head \
+  --direction BtoA \
+  --model dual_velocity \
+  --gpu_ids 0,1 \
+  --batch_size 4 \
+  --ode_steps 8 \
+  --ss_steps 7 \
+  --lambda_struct 0.10 \
+  --lambda_kin 0.10 \
+  --tag dual_velocity_dp
+```
+
+### Recommended Hyperparameter Starters
+
+| Preset | Use case | `lambda_struct` | `lambda_kin` | `ode_steps` | `ss_steps` | `ode_solver` | Notes |
+|---|---|---:|---:|---:|---:|---|---|
+| Stable | First run / avoid artifacts | 0.20 | 0.20 | 8 | 7 | euler | Stronger regularization, slower but safer |
+| Balanced (default) | General benchmark | 0.10 | 0.10 | 8 | 7 | euler | Good tradeoff of sharpness and stability |
+| Aggressive | Max fidelity / less smoothing | 0.05 | 0.05 | 12 | 7 | heun | Better detail potential, may need LR tuning |
+
+Practical tuning order:
+1. Keep `ode_steps=8`, tune `lambda_struct` first (`0.05 -> 0.10 -> 0.20`).
+2. Then tune `lambda_kin` with the same grid.
+3. If outputs still look over-smoothed, try `ode_solver=heun` and `ode_steps=12`.
+4. If training destabilizes, revert to `euler`, reduce `ode_steps`, or increase `lambda_kin`.
 
 ## 📥 Pretrained Models
 
@@ -66,4 +134,3 @@ If you find this work useful in your research or applications, please consider c
 
 This code utilizes libraries and components from the [Santa](https://github.com/Mid-Push/santa) and [CUT](https://github.com/taesungp/contrastive-unpaired-translation) repositories.  
 We sincerely thank the authors of these projects for making their code publicly available.
-

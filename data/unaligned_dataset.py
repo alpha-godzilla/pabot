@@ -36,6 +36,11 @@ class UnalignedDataset(BaseDataset):
         self.B_paths = sorted(make_dataset(self.dir_B, opt.max_dataset_size))    # load images from '/path/to/data/trainB'
         self.A_size = len(self.A_paths)  # get the size of dataset A
         self.B_size = len(self.B_paths)  # get the size of dataset B
+        self.controlled_pairing = bool(getattr(opt, "controlled_pairing", False) and opt.phase == "train")
+        self.paired_ratio = float(getattr(opt, "paired_ratio", 0.1))
+        self.pair_seed = int(getattr(opt, "pair_seed", 3407))
+        pair_base_size = min(self.A_size, self.B_size)
+        self.paired_cutoff = max(0, min(pair_base_size, int(self.paired_ratio * pair_base_size)))
 
     def __getitem__(self, index):
         """Return a data point and its metadata information.
@@ -50,10 +55,21 @@ class UnalignedDataset(BaseDataset):
             B_paths (str)    -- image paths
         """
         A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
-        if self.opt.serial_batches:   # make sure index is within then range
+        if self.controlled_pairing:
+            # Front paired_ratio samples are strictly paired; the rest are reproducibly unpaired.
+            is_paired = (index % self.A_size) < self.paired_cutoff and (index % self.A_size) < self.B_size
+            if is_paired:
+                index_B = index % self.B_size
+            else:
+                unpaired_low = min(self.paired_cutoff, self.B_size - 1)
+                rng = random.Random(self.pair_seed + self.current_epoch * 1000003 + index)
+                index_B = rng.randint(unpaired_low, self.B_size - 1)
+        elif self.opt.serial_batches:   # make sure index is within then range
             index_B = index % self.B_size
+            is_paired = True
         else:   # randomize the index for domain B to avoid fixed pairs.
             index_B = random.randint(0, self.B_size - 1)
+            is_paired = False
         B_path = self.B_paths[index_B]
         A_img = Image.open(A_path).convert('RGB')
         B_img = Image.open(B_path).convert('RGB')
@@ -68,7 +84,7 @@ class UnalignedDataset(BaseDataset):
         A = transform(A_img)
         B = transform(B_img)
 
-        return {'A': A, 'B': B, 'A_paths': A_path, 'B_paths': B_path}
+        return {'A': A, 'B': B, 'A_paths': A_path, 'B_paths': B_path, 'is_paired': is_paired}
 
     def __len__(self):
         """Return the total number of images in the dataset.
