@@ -7,6 +7,7 @@ import numpy as np
 import torch.utils.data as data
 from PIL import Image
 import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
 from abc import ABC, abstractmethod
 
 
@@ -81,15 +82,16 @@ def get_params(opt, size):
 
 def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, convert=True):
     transform_list = []
+    interpolation = __to_interpolation_mode(method)
     if grayscale:
         transform_list.append(transforms.Grayscale(1))
     if 'fixsize' in opt.preprocess:
-        transform_list.append(transforms.Resize(params["size"], method))
+        transform_list.append(transforms.Resize(params["size"], interpolation=interpolation))
     if 'resize' in opt.preprocess:
         osize = [opt.load_size, opt.load_size]
         if "gta2cityscapes" in opt.dataroot:
             osize[0] = opt.load_size // 2
-        transform_list.append(transforms.Resize(osize, method))
+        transform_list.append(transforms.Resize(osize, interpolation=interpolation))
     elif 'scale_width' in opt.preprocess:
         transform_list.append(transforms.Lambda(lambda img: __scale_width(img, opt.load_size, opt.crop_size, method)))
     elif 'scale_shortside' in opt.preprocess:
@@ -129,6 +131,20 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
         else:
             transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     return transforms.Compose(transform_list)
+
+
+def __to_interpolation_mode(method):
+    if isinstance(method, InterpolationMode):
+        return method
+    mapping = {
+        Image.NEAREST: InterpolationMode.NEAREST,
+        Image.BILINEAR: InterpolationMode.BILINEAR,
+        Image.BICUBIC: InterpolationMode.BICUBIC,
+        Image.BOX: InterpolationMode.BOX,
+        Image.HAMMING: InterpolationMode.HAMMING,
+        Image.LANCZOS: InterpolationMode.LANCZOS,
+    }
+    return mapping.get(method, InterpolationMode.BICUBIC)
 
 
 def __make_power_2(img, base, method=Image.BICUBIC):

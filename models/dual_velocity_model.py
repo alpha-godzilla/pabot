@@ -154,6 +154,8 @@ class DualVelocityModel(BaseModel):
         parser.add_argument("--style_dim", type=int, default=8, help="style code dimensionality for AdaIN decoder")
         parser.add_argument("--ode_steps", type=int, default=8, help="number of unfolding steps for v_gen")
         parser.add_argument("--ss_steps", type=int, default=7, help="scaling-and-squaring steps for v_struct")
+        parser.add_argument("--gen_hidden_channels", type=int, default=128,
+                            help="hidden channels for latent velocity predictor netGen")
         parser.add_argument("--use_struct_flow", type=util.str2bool, nargs="?", const=True, default=True,
                             help="enable structural deformation flow before generative flow")
         parser.add_argument("--ode_solver", type=str, default="euler", choices=["euler", "heun"],
@@ -220,7 +222,7 @@ class DualVelocityModel(BaseModel):
             self.gpu_ids,
         )
         self.netGen = networks.init_net(
-            LatentVelocityNet(latent_channels, hidden_channels=max(64, opt.ngf * 2)),
+            LatentVelocityNet(latent_channels, hidden_channels=max(64, int(opt.gen_hidden_channels))),
             opt.init_type,
             opt.init_gain,
             self.gpu_ids,
@@ -269,7 +271,7 @@ class DualVelocityModel(BaseModel):
                 self.opt.crop_size,
                 device=self.device,
             )
-            latent = self.netG(dummy, mode="encode")
+            latent = self.netG(dummy, [], "encode")
         return latent.shape[1]
 
     def set_input(self, input):
@@ -280,11 +282,11 @@ class DualVelocityModel(BaseModel):
 
     def _decode(self, latents, domain_value):
         domain = torch.full((latents.size(0), 1), float(domain_value), device=latents.device, dtype=latents.dtype)
-        return self.netG((latents, domain), mode="decode")
+        return self.netG((latents, domain), [], "decode")
 
     def forward(self):
         real = torch.cat([self.real_A, self.real_B], dim=0)
-        latents = self.netG(real, mode="encode")
+        latents = self.netG(real, [], "encode")
 
         if self.isTrain and self.opt.noise_std > 0:
             noise = torch.randn_like(latents) * self.opt.noise_std
@@ -411,7 +413,7 @@ class DualVelocityModel(BaseModel):
 
     @torch.no_grad()
     def single_forward(self):
-        latent = self.netG(self.real_A, mode="encode")
+        latent = self.netG(self.real_A, [], "encode")
         latents_fake, _, _ = self.inference(latent, apply_deformation=self.opt.use_struct_flow)
         _ = self._decode(latents_fake, domain_value=1.0)
 
@@ -422,7 +424,7 @@ class DualVelocityModel(BaseModel):
         self.netStruct.eval()
         self.netGen.eval()
 
-        latent = self.netG(x, mode="encode")
+        latent = self.netG(x, [], "encode")
         latents_fake, _, _ = self.inference(latent, apply_deformation=self.opt.use_struct_flow)
         out = self._decode(latents_fake, domain_value=1.0)
 
@@ -445,7 +447,7 @@ class DualVelocityModel(BaseModel):
 
         interps = []
         for i in range(min(x.size(0), 2)):
-            latent = self.netG(x[i].unsqueeze(0), mode="encode")
+            latent = self.netG(x[i].unsqueeze(0), [], "encode")
             _, _, _, path_states = self.inference(
                 latent,
                 apply_deformation=self.opt.use_struct_flow,
@@ -475,8 +477,8 @@ class DualVelocityModel(BaseModel):
         x_b_recon = []
         x_ab = []
         for i in range(x_a.size(0)):
-            h_a = self.netG(x_a[i].unsqueeze(0), mode="encode")
-            h_b = self.netG(x_b[i].unsqueeze(0), mode="encode")
+            h_a = self.netG(x_a[i].unsqueeze(0), [], "encode")
+            h_b = self.netG(x_b[i].unsqueeze(0), [], "encode")
 
             x_a_recon.append(self._decode(h_a, domain_value=0.0))
             x_b_recon.append(self._decode(h_b, domain_value=1.0))
