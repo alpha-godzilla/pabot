@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from .base_model import BaseModel
 from . import networks
+from .attention_phi import AttentionPhi
+from .dino_attention import DinoAttentionExtractor
 from .dual_velocity_model import LatentVelocityNet
 from util.image_pool import ImagePool
 import util.util as util
@@ -56,6 +58,7 @@ class LatentViTFeatureExtractor(nn.Module):
         self.blocks = nn.ModuleList([ViTEncoderBlock(embed_dim=embed_dim, num_heads=num_heads) for _ in range(depth)])
         self.proj = nn.Conv2d(embed_dim, out_channels, kernel_size=1)
         self.last_attn_map = None
+        self.last_attn_weights = None
 
     def forward(self, x):
         b, _, h, w = x.shape
@@ -69,6 +72,7 @@ class LatentViTFeatureExtractor(nn.Module):
             last_attn = attn_w
 
         if last_attn is not None:
+            self.last_attn_weights = last_attn.detach()
             # last_attn: [B, heads, N, N], convert to token saliency over keys.
             token_score = last_attn.mean(dim=1).mean(dim=1)
             attn_2d = token_score.view(b, 1, hp, wp)
@@ -79,6 +83,7 @@ class LatentViTFeatureExtractor(nn.Module):
             self.last_attn_map = attn_2d
         else:
             self.last_attn_map = None
+            self.last_attn_weights = None
 
         tokens_2d = tokens.transpose(1, 2).reshape(b, -1, hp, wp)
         feat = self.proj(tokens_2d)
@@ -88,6 +93,9 @@ class LatentViTFeatureExtractor(nn.Module):
 
     def get_last_attention_map(self):
         return self.last_attn_map
+
+    def get_last_attention_weights(self):
+        return self.last_attn_weights
 
 
 class StructureVelocityGenerator(nn.Module):
@@ -149,7 +157,7 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--ode_steps", type=int, default=8, help="number of unfolding steps")
         parser.add_argument("--warmup_epochs", type=int, default=10, help="warmup epochs without structure guidance")
         parser.add_argument("--struct_channels", type=int, default=64, help="structure feature channels for net_A")
-        parser.add_argument("--a_backbone", type=str, default="cnn", choices=["cnn", "vit", "dit"],
+        parser.add_argument("--a_backbone", type=str, default="vit", choices=["cnn", "vit", "dit"],
                             help="backbone for structure feature extractor net_A")
         parser.add_argument("--a_vit_dim", type=int, default=256, help="embed dim for ViT-based net_A")
         parser.add_argument("--a_vit_depth", type=int, default=4, help="encoder depth for ViT-based net_A")
@@ -158,13 +166,49 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--gen_hidden_channels", type=int, default=128,
                             help="hidden channels for latent velocity predictor netGen")
         parser.add_argument("--vgen_scale", type=float, default=1.0, help="scale factor applied to latent v_g prediction")
+        parser.add_argument("--struct_velocity_mode", type=str, default="learned", choices=["learned", "perturb"],
+                            help="how to construct the structural velocity field")
+        parser.add_argument("--perturb_eps", type=float, default=0.02,
+                            help="finite perturbation radius for structural energy estimation")
+        parser.add_argument("--perturb_samples", type=int, default=1,
+                            help="number of random perturbation directions per ODE step")
+        parser.add_argument("--struct_grad_scale", type=float, default=0.1,
+                            help="scale factor applied to perturbation-induced structural velocity")
+        parser.add_argument("--attn_norm_eps", type=float, default=1e-6,
+                            help="epsilon used when normalizing multi-channel structural features")
+        parser.add_argument("--perturb_ortho_scale", type=float, default=0.1,
+                            help="extra scale applied to lambda_ortho in perturb mode")
         parser.add_argument("--log_attention_map", type=util.str2bool, nargs="?", const=True, default=True,
                             help="log structure attention map in visual outputs")
         parser.add_argument("--use_structure_attention", type=util.str2bool, nargs="?", const=True, default=True,
                             help="enable structure attention branch in non-warmup phases")
+        parser.add_argument("--structure_attention_source", type=str, default="rollout", choices=["internal", "rollout"],
+                            help="source used to build structure reference in paired distillation")
+        parser.add_argument("--lambda_v0_match", type=float, default=1.0,
+                            help="weight for matching learned structural velocity against distilled V0")
+        parser.add_argument("--lambda_phi_pair", type=float, default=1.0,
+                            help="weight for paired structure feature consistency loss")
+        parser.add_argument("--lambda_phi_attn", type=float, default=1.0,
+                            help="weight for phi(attn_mri) -> attn_ct supervision during phi pretraining")
+        parser.add_argument("--v0_stopgrad_phi", type=util.str2bool, nargs="?", const=True, default=True,
+                            help="stop gradients to net_A when computing distilled V0 labels")
+        parser.add_argument("--phi_hidden_channels", type=int, default=32,
+                            help="hidden channels for the MRI-to-CT attention mapper phi")
+        parser.add_argument("--phi_pretrain_epochs", type=int, default=5,
+                            help="legacy alias for max phi pretrain epochs before warmup")
+        parser.add_argument("--phi_pretrain_max_epochs", type=int, default=None,
+                    help="maximum number of epochs used to pretrain phi; if omitted, uses phi_pretrain_epochs")
+        parser.add_argument("--phi_pretrain_loss_threshold", type=float, default=-1.0,
+                            help="stop phi pretraining early when EMA phi loss <= threshold; negative disables")
+        parser.add_argument("--phi_pretrain_ema_momentum", type=float, default=0.9,
+                            help="EMA momentum used for phi loss early-stop tracking")
+        parser.add_argument("--dino_model_name", type=str, default="dino_vitb8",
+                            help="torch.hub DINO model name")
+        parser.add_argument("--dino_image_size", type=int, default=224,
+                            help="input size used for frozen DINO attention extraction")
         parser.add_argument("--tag", type=str, default="dual_velocity_struct", help="experiment tag")
 
-        parser.set_defaults(no_html=True, pool_size=0)
+        parser.set_defaults(no_html=True, pool_size=0, controlled_pairing=True, paired_ratio=0.1)
         opt, _ = parser.parse_known_args()
         if opt.phase != "test":
             model_id = "%s" % opt.tag
@@ -193,16 +237,27 @@ class DualVelocityStructModel(BaseModel):
             "G_vs",
             "G_ortho",
             "G_pair",
+            "G_v0_match",
+            "G_phi_pair",
             "G_total",
         ]
         self.visual_names = ["real_A", "fake_B", "real_B"]
         if opt.log_attention_map:
             self.visual_names.append("attn_map")
 
+        self.use_learned_struct = opt.struct_velocity_mode == "learned"
+        self.ortho_weight = float(opt.lambda_ortho)
+        if not self.use_learned_struct:
+            self.ortho_weight *= float(opt.perturb_ortho_scale)
+
         if self.isTrain:
-            self.model_names = ["G", "Gen", "A", "VStruct", "D"]
+            self.model_names = ["G", "Gen", "Phi", "D"]
+            if self.use_learned_struct:
+                self.model_names.insert(3, "VStruct")
         else:
-            self.model_names = ["G", "Gen", "A", "VStruct"]
+            self.model_names = ["G", "Gen", "Phi"]
+            if self.use_learned_struct:
+                self.model_names.append("VStruct")
 
         self.netG = networks.define_G(
             opt.input_nc,
@@ -220,7 +275,6 @@ class DualVelocityStructModel(BaseModel):
         )
 
         latent_channels = self._infer_latent_channels()
-        struct_channels = max(1, int(opt.struct_channels))
 
         self.netGen = networks.init_net(
             LatentVelocityNet(latent_channels, hidden_channels=max(64, int(opt.gen_hidden_channels))),
@@ -228,34 +282,33 @@ class DualVelocityStructModel(BaseModel):
             opt.init_gain,
             self.gpu_ids,
         )
-        if opt.a_backbone in {"vit", "dit"}:
-            net_a = LatentViTFeatureExtractor(
-                latent_channels,
-                struct_channels,
-                embed_dim=opt.a_vit_dim,
-                depth=opt.a_vit_depth,
-                num_heads=opt.a_vit_heads,
-                patch_size=opt.a_vit_patch,
+        self.netPhi = networks.init_net(
+            AttentionPhi(in_channels=1, hidden_channels=max(8, int(opt.phi_hidden_channels))),
+            opt.init_type,
+            opt.init_gain,
+            self.gpu_ids,
+        )
+        self.netA = self.netPhi
+        self.dino_extractor = DinoAttentionExtractor(
+            model_name=opt.dino_model_name,
+            image_size=opt.dino_image_size,
+        ).to(self.device)
+        self.dino_extractor.eval()
+        if self.use_learned_struct:
+            self.netVStruct = networks.init_net(
+                StructureVelocityGenerator(latent_channels + 1, latent_channels, hidden_channels=max(64, opt.ngf * 2)),
+                opt.init_type,
+                opt.init_gain,
+                self.gpu_ids,
+                initialize_weights=False,
             )
         else:
-            net_a = StructureFeatureExtractor(latent_channels, struct_channels)
-        self.netA = networks.init_net(
-            net_a,
-            opt.init_type,
-            opt.init_gain,
-            self.gpu_ids,
-        )
-        self.netVStruct = networks.init_net(
-            StructureVelocityGenerator(latent_channels + struct_channels, latent_channels, hidden_channels=max(64, opt.ngf * 2)),
-            opt.init_type,
-            opt.init_gain,
-            self.gpu_ids,
-            initialize_weights=False,
-        )
+            self.netVStruct = None
 
         self.model_gen = self.netGen
-        self.net_A = self.netA
-        self.net_V_struct = self.netVStruct
+        self.net_A = self.netPhi
+        if self.netVStruct is not None:
+            self.net_V_struct = self.netVStruct
         self.d_A = torch.zeros([1], device=self.device)
         self.d_B = torch.ones([1], device=self.device)
 
@@ -281,12 +334,37 @@ class DualVelocityStructModel(BaseModel):
                 lr=opt.lr,
                 betas=(opt.beta1, opt.beta2),
             )
-            self.optimizer_A = torch.optim.Adam(self.netA.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
-            self.optimizer_V_struct = torch.optim.Adam(self.netVStruct.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizer_Phi = torch.optim.Adam(self.netPhi.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizer_A = self.optimizer_Phi
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
-            self.optimizers.extend([self.optimizer_gen, self.optimizer_A, self.optimizer_V_struct, self.optimizer_D])
+            self.optimizers.extend([self.optimizer_gen, self.optimizer_Phi, self.optimizer_D])
+            self.optimizer_V_struct = None
+            if self.netVStruct is not None:
+                self.optimizer_V_struct = torch.optim.Adam(self.netVStruct.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+                self.optimizers.insert(2, self.optimizer_V_struct)
 
         self._init_loss_tensors()
+        self.phi_pretrain_end_stage_epoch = None
+        self.phi_pretrain_ema_loss = None
+
+    def _phase_state_path(self, epoch):
+        return os.path.join(self.save_dir, f"{epoch}_phase_state.pth")
+
+    def save_networks(self, epoch):
+        super().save_networks(epoch)
+        phase_state = {
+            "phi_pretrain_end_stage_epoch": self.phi_pretrain_end_stage_epoch,
+            "phi_pretrain_ema_loss": self.phi_pretrain_ema_loss,
+        }
+        torch.save(phase_state, self._phase_state_path(epoch))
+
+    def load_networks(self, epoch):
+        super().load_networks(epoch)
+        phase_state_path = self._phase_state_path(epoch)
+        if os.path.exists(phase_state_path):
+            phase_state = torch.load(phase_state_path, map_location=self.device)
+            self.phi_pretrain_end_stage_epoch = phase_state.get("phi_pretrain_end_stage_epoch", None)
+            self.phi_pretrain_ema_loss = phase_state.get("phi_pretrain_ema_loss", None)
 
     def _init_loss_tensors(self):
         zero = torch.tensor(0.0, device=self.device)
@@ -300,6 +378,8 @@ class DualVelocityStructModel(BaseModel):
         self.loss_G_vs = zero
         self.loss_G_ortho = zero
         self.loss_G_pair = zero
+        self.loss_G_v0_match = zero
+        self.loss_G_phi_pair = zero
         self.loss_G_total = zero
 
     def _infer_latent_channels(self):
@@ -329,16 +409,10 @@ class DualVelocityStructModel(BaseModel):
     def _unwrap_module(net):
         return net.module if isinstance(net, torch.nn.DataParallel) else net
 
-    def _build_attention_map(self, latent_A):
+    def _build_attention_map(self, images_A):
         with torch.no_grad():
-            net_a = self._unwrap_module(self.netA)
-            feat = net_a(latent_A)
-            if hasattr(net_a, "get_last_attention_map"):
-                attn = net_a.get_last_attention_map()
-            else:
-                attn = None
-            if attn is None:
-                attn = feat.abs().mean(dim=1, keepdim=True)
+            attn = self.dino_extractor(images_A)
+            attn = self.netPhi(attn)
             attn = F.interpolate(attn, size=self.real_A.shape[2:], mode="bilinear", align_corners=False)
             attn = attn / (attn.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6))
             return attn * 2.0 - 1.0
@@ -366,16 +440,107 @@ class DualVelocityStructModel(BaseModel):
         v_g = net_gen(latents, t_tensor)
         return v_g * float(self.opt.vgen_scale)
 
-    def inference(self, latents_A, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
+    def _normalize_struct_features(self, feat):
+        denom = feat.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(float(self.opt.attn_norm_eps))
+        return feat / denom
+
+    def _extract_attention_map(self, images):
+        return self.dino_extractor(images)
+
+    def _predict_target_attention(self, images_A, net_phi=None, detach=False):
+        net_phi = self.netPhi if net_phi is None else net_phi
+        attn_mri = self._extract_attention_map(images_A)
+        attn_ct_pred = net_phi(attn_mri)
+        if detach:
+            attn_ct_pred = attn_ct_pred.detach()
+        return attn_ct_pred
+
+    def _resize_attention_for_latent(self, attn_map, latents):
+        return F.interpolate(attn_map, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+
+    def _build_struct_condition(self, images_A, latents, net_phi=None, detach=True):
+        attn_target = self._predict_target_attention(images_A, net_phi=net_phi, detach=detach)
+        attn_target = self._normalize_struct_features(attn_target)
+        return self._resize_attention_for_latent(attn_target, latents)
+
+    def _estimate_v_s_perturb(self, latents, ref_struct):
+        eps = float(self.opt.perturb_eps)
+        num_samples = max(1, int(self.opt.perturb_samples))
+        g_hat = torch.zeros_like(latents)
+
+        for _ in range(num_samples):
+            direction = torch.empty_like(latents).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            e_plus = self._latent_attention_energy(latents + eps * direction, ref_struct)
+            e_minus = self._latent_attention_energy(latents - eps * direction, ref_struct)
+            coeff = ((e_plus - e_minus) / (2.0 * eps)).view(-1, 1, 1, 1)
+            g_hat = g_hat + coeff * direction
+
+        g_hat = g_hat / float(num_samples)
+        g_hat = g_hat / g_hat.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        return -float(self.opt.struct_grad_scale) * g_hat
+
+    def _latent_attention_energy(self, latents_t, ref_attn):
+        images_t = self._decode(latents_t, domain_value=1.0)
+        attn_t = self._extract_attention_map(images_t)
+        attn_t = self._normalize_struct_features(attn_t)
+        ref_attn = self._normalize_struct_features(ref_attn.detach())
+        return (attn_t - ref_attn).square().mean(dim=(1, 2, 3))
+
+    def _compute_v0_label(self, latents_t, ref_attn):
+        latents_t = latents_t.detach().requires_grad_(True)
+
+        original_flags = None
+        if bool(self.opt.v0_stopgrad_phi):
+            original_flags = [param.requires_grad for param in self.netPhi.parameters()]
+            for param in self.netPhi.parameters():
+                param.requires_grad = False
+
+        energy = self._latent_attention_energy(latents_t, ref_attn).sum()
+        grad = torch.autograd.grad(energy, latents_t, create_graph=False, retain_graph=False)[0]
+        v0 = -float(self.opt.struct_grad_scale) * grad
+        v0 = v0 / v0.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+
+        if original_flags is not None:
+            for param, flag in zip(self.netPhi.parameters(), original_flags):
+                param.requires_grad = flag
+        return v0.detach()
+
+    def _phi_pretrain_step(self, images_A, images_B):
+        if not self.isTrain:
+            return None
+
+        self._set_trainable(self.netG, False)
+        self._set_trainable(self.netGen, False)
+        self._set_trainable(self.netPhi, True)
+        if self.netVStruct is not None:
+            self._set_trainable(self.netVStruct, False)
+        self._set_trainable(self.netD, False)
+
+        self.optimizer_Phi.zero_grad()
+        with torch.no_grad():
+            attn_mri = self._extract_attention_map(images_A)
+            attn_ct = self._extract_attention_map(images_B)
+        pred_ct = self.netPhi(attn_mri)
+        loss_phi = F.mse_loss(
+            self._normalize_struct_features(pred_ct),
+            self._normalize_struct_features(attn_ct),
+        )
+        (self.opt.lambda_phi_attn * loss_phi).backward()
+        self.optimizer_Phi.step()
+        return loss_phi.detach()
+
+    def inference(self, latents_A, source_images=None, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
         latents = latents_A
         num_steps = max(1, int(self.opt.ode_steps))
         dt = 1.0 / num_steps
 
         net_gen = self.netGen if net_gen is None else net_gen
-        net_a = self.netA if net_a is None else net_a
+        net_phi = self.netPhi if net_a is None else net_a
         net_v_struct = self.netVStruct if net_v_struct is None else net_v_struct
 
-        S_0 = net_a(latents_A) if (use_structure and self.opt.use_structure_attention) else None
+        S_0 = None
+        if use_structure and self.opt.use_structure_attention and source_images is not None:
+            S_0 = self._build_struct_condition(source_images, latents_A, net_phi=net_phi, detach=True)
         v_gen_history = []
         v_struct_history = []
 
@@ -387,7 +552,10 @@ class DualVelocityStructModel(BaseModel):
                 v_g = v_g.detach()
 
             if S_0 is not None:
-                v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_tensor)
+                if self.use_learned_struct:
+                    v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_tensor)
+                else:
+                    v_s = self._estimate_v_s_perturb(latents, S_0)
             else:
                 v_s = torch.zeros_like(v_g)
 
@@ -399,7 +567,7 @@ class DualVelocityStructModel(BaseModel):
         v_struct_stacked = torch.stack(v_struct_history, dim=0)
         return latents, v_gen_stacked, v_struct_stacked
 
-    def _integrate_latent_async_for_vis(self, latent, steps, net_gen=None, net_a=None, net_v_struct=None):
+    def _integrate_latent_async_for_vis(self, latent, source_image, steps, net_gen=None, net_a=None, net_v_struct=None):
         """
         Asynchronous integration for visualization:
         use different time inputs for v_g and v_s, then decode after integration.
@@ -407,24 +575,26 @@ class DualVelocityStructModel(BaseModel):
         latents = latent
         dt = 1.0 / max(1, steps)
         net_gen = self.netGen if net_gen is None else net_gen
-        net_a = self.netA if net_a is None else net_a
+        net_phi = self.netPhi if net_a is None else net_a
         net_v_struct = self.netVStruct if net_v_struct is None else net_v_struct
-        S_0 = net_a(latent) if self.opt.use_structure_attention else None
+        S_0 = None
+        if self.opt.use_structure_attention:
+            S_0 = self._build_struct_condition(source_image, latent, net_phi=net_phi, detach=True)
 
         states = [latents]
         for step in range(steps):
             t_g = float(step) / steps
-            # Half-step phase shift for structural velocity, making two fields asynchronous.
-            t_s = (float(step) + 0.5) / steps
-            if t_s >= 1.0:
-                t_s -= 1.0
-
             t_g_tensor = torch.full((latents.shape[0],), t_g, device=latents.device, dtype=latents.dtype)
-            t_s_tensor = torch.full((latents.shape[0],), t_s, device=latents.device, dtype=latents.dtype)
-
             v_g = self._predict_v_g(latents, t_g_tensor, net_gen=net_gen)
             if S_0 is not None:
-                v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_s_tensor)
+                if self.use_learned_struct:
+                    t_s = (float(step) + 0.5) / steps
+                    if t_s >= 1.0:
+                        t_s -= 1.0
+                    t_s_tensor = torch.full((latents.shape[0],), t_s, device=latents.device, dtype=latents.dtype)
+                    v_s = net_v_struct(torch.cat([latents, S_0], dim=1), t_s_tensor)
+                else:
+                    v_s = self._estimate_v_s_perturb(latents, S_0)
             else:
                 v_s = torch.zeros_like(v_g)
 
@@ -454,7 +624,12 @@ class DualVelocityStructModel(BaseModel):
 
     def _unpaired_step(self, images_A, images_B, use_structure):
         latent_A, latent_B, mu = self._encode_latents(images_A, images_B, use_noise=True)
-        latents_fake, v_g_hist, v_s_hist = self.inference(latent_A, use_structure=use_structure, detach_vg=False)
+        latents_fake, v_g_hist, v_s_hist = self.inference(
+            latent_A,
+            source_images=images_A,
+            use_structure=use_structure,
+            detach_vg=False,
+        )
 
         fake_B = self._decode(latents_fake, domain_value=1.0)
         rec_A = self._decode(latent_A, domain_value=0.0)
@@ -468,7 +643,8 @@ class DualVelocityStructModel(BaseModel):
 
         self._set_trainable(self.netD, False)
         self.optimizer_gen.zero_grad()
-        self.optimizer_V_struct.zero_grad()
+        if self.optimizer_V_struct is not None:
+            self.optimizer_V_struct.zero_grad()
 
         loss_gan = self.criterionGAN(self.netD(fake_B), True).mean()
         loss_rec = self.criterionIdt(rec_A, images_A).mean()
@@ -485,12 +661,12 @@ class DualVelocityStructModel(BaseModel):
             + self.opt.lambda_kl * loss_kl
             + self.opt.lambda_path * loss_path
             + self.opt.lambda_vs * loss_vs
-            + self.opt.lambda_ortho * loss_ortho
+            + self.ortho_weight * loss_ortho
         )
 
         loss_g_total.backward()
         self.optimizer_gen.step()
-        if use_structure and self.opt.use_structure_attention:
+        if use_structure and self.opt.use_structure_attention and self.optimizer_V_struct is not None:
             self.optimizer_V_struct.step()
 
         return {
@@ -506,56 +682,143 @@ class DualVelocityStructModel(BaseModel):
             "loss_G_ortho": loss_ortho.detach(),
             "loss_G_total": loss_g_total.detach(),
             "loss_G_pair": torch.tensor(0.0, device=self.device),
+            "loss_G_v0_match": torch.tensor(0.0, device=self.device),
+            "loss_G_phi_pair": torch.tensor(0.0, device=self.device),
         }
 
     def _paired_step(self, images_A, images_B):
         self._set_trainable(self.netG, False)
         self._set_trainable(self.netGen, False)
         self._set_trainable(self.netD, False)
-        self._set_trainable(self.netA, True)
-        self._set_trainable(self.netVStruct, True)
+        self._set_trainable(self.netPhi, False)
+        if self.netVStruct is not None:
+            self._set_trainable(self.netVStruct, True)
 
         with torch.no_grad():
             latent_A, latent_B, _ = self._encode_latents(images_A, images_B, use_noise=False)
+            ref_attn = self._predict_target_attention(images_A, detach=True)
+            loss_phi_pair = F.mse_loss(
+                self._normalize_struct_features(ref_attn),
+                self._normalize_struct_features(self._extract_attention_map(images_B)),
+            )
 
-        self.optimizer_A.zero_grad()
-        self.optimizer_V_struct.zero_grad()
+        if self.optimizer_V_struct is not None:
+            self.optimizer_V_struct.zero_grad()
 
-        latents_fake, v_g_hist, v_s_hist = self.inference(latent_A.detach(), use_structure=True, detach_vg=True)
+        latents_fake, v_g_hist, v_s_hist = self.inference(
+            latent_A.detach(),
+            source_images=images_A,
+            use_structure=True,
+            detach_vg=True,
+        )
         loss_pair = F.mse_loss(latents_fake, latent_B.detach())
         loss_vs = self._vs_l2_penalty(v_s_hist)
         loss_ortho = self._orthogonality_loss(v_g_hist, v_s_hist)
-        loss_total = self.opt.lambda_pair * loss_pair + self.opt.lambda_vs * loss_vs + self.opt.lambda_ortho * loss_ortho
+        struct_condition = self._build_struct_condition(images_A, latent_A.detach(), detach=True)
+
+        batch_size = latent_A.size(0)
+        t_rand = torch.rand(batch_size, device=latent_A.device, dtype=latent_A.dtype)
+        xt = torch.lerp(latent_A.detach(), latent_B.detach(), t_rand.view(-1, 1, 1, 1))
+        v0_label = self._compute_v0_label(xt, ref_attn)
+        if self.use_learned_struct:
+            cond_xt = self._resize_attention_for_latent(struct_condition, xt)
+            v_s_pred = self.netVStruct(torch.cat([xt, cond_xt], dim=1), t_rand)
+        else:
+            v_s_pred = self._estimate_v_s_perturb(xt, ref_attn)
+        loss_v0_match = F.mse_loss(v_s_pred, v0_label)
+
+        loss_total = (
+            self.opt.lambda_pair * loss_pair
+            + self.opt.lambda_vs * loss_vs
+            + self.ortho_weight * loss_ortho
+            + self.opt.lambda_v0_match * loss_v0_match
+        )
 
         loss_total.backward()
-        self.optimizer_A.step()
-        self.optimizer_V_struct.step()
+        if self.optimizer_V_struct is not None:
+            self.optimizer_V_struct.step()
 
         return {
             "loss_G_pair": loss_pair.detach(),
             "loss_G_vs": loss_vs.detach(),
             "loss_G_ortho": loss_ortho.detach(),
+            "loss_G_v0_match": loss_v0_match.detach(),
+            "loss_G_phi_pair": loss_phi_pair.detach(),
         }
 
     def forward(self):
         latent_A, latent_B, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
-        latents_fake, _, _ = self.inference(latent_A, use_structure=True, detach_vg=False)
+        latents_fake, _, _ = self.inference(latent_A, source_images=self.real_A, use_structure=True, detach_vg=False)
         self.fake_B = self._decode(latents_fake, domain_value=1.0)
         self.rec_A = self._decode(latent_A, domain_value=0.0)
         self.idt_B = self._decode(latent_B, domain_value=1.0)
         if self.opt.log_attention_map:
-            self.attn_map = self._build_attention_map(latent_A)
+            self.attn_map = self._build_attention_map(self.real_A)
 
     def optimize_parameters(self):
         self._init_loss_tensors()
         epoch = int(self.get_epoch())
-        is_warmup = epoch < int(self.opt.warmup_epochs)
+        stage_epoch = max(0, epoch - int(getattr(self.opt, "epoch_count", 1)))
+
+        phi_pretrain_epochs = int(getattr(self.opt, "phi_pretrain_epochs", 0))
+        phi_pretrain_max_epochs = getattr(self.opt, "phi_pretrain_max_epochs", None)
+        if phi_pretrain_max_epochs is None:
+            max_phi_epochs = phi_pretrain_epochs
+        else:
+            max_phi_epochs = int(phi_pretrain_max_epochs)
+        max_phi_epochs = max(0, max_phi_epochs)
+        phi_loss_threshold = float(getattr(self.opt, "phi_pretrain_loss_threshold", -1.0))
+
+        if self.phi_pretrain_end_stage_epoch is None and stage_epoch >= max_phi_epochs:
+            self.phi_pretrain_end_stage_epoch = stage_epoch
+            print(f"[stage] phi pretraining finished by max epoch at stage_epoch={stage_epoch}")
+
+        if (
+            self.phi_pretrain_end_stage_epoch is None
+            and phi_loss_threshold >= 0.0
+            and self.phi_pretrain_ema_loss is not None
+            and self.phi_pretrain_ema_loss <= phi_loss_threshold
+        ):
+            self.phi_pretrain_end_stage_epoch = stage_epoch
+            print(
+                "[stage] phi pretraining finished by loss threshold "
+                f"(ema={self.phi_pretrain_ema_loss:.6f} <= {phi_loss_threshold:.6f}) at stage_epoch={stage_epoch}"
+            )
+
+        is_phi_pretrain = self.phi_pretrain_end_stage_epoch is None
+        if self.phi_pretrain_end_stage_epoch is None:
+            phi_done_offset = 0
+        else:
+            phi_done_offset = max(0, stage_epoch - int(self.phi_pretrain_end_stage_epoch))
+        is_warmup = (not is_phi_pretrain) and (phi_done_offset < int(self.opt.warmup_epochs))
+
+        if is_phi_pretrain:
+            phi_loss = None
+            if self.is_paired.any():
+                phi_loss = self._phi_pretrain_step(self.real_A[self.is_paired], self.real_B[self.is_paired])
+                if phi_loss is not None:
+                    momentum = float(getattr(self.opt, "phi_pretrain_ema_momentum", 0.9))
+                    momentum = min(max(momentum, 0.0), 0.9999)
+                    phi_loss_val = float(phi_loss.item())
+                    if self.phi_pretrain_ema_loss is None:
+                        self.phi_pretrain_ema_loss = phi_loss_val
+                    else:
+                        self.phi_pretrain_ema_loss = momentum * self.phi_pretrain_ema_loss + (1.0 - momentum) * phi_loss_val
+            self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
+            self.loss_G_total = self.loss_G_phi_pair
+            self.fake_B = self.real_B.detach()
+            self.rec_A = self.real_A.detach()
+            self.idt_B = self.real_B.detach()
+            if self.opt.log_attention_map:
+                self.attn_map = self._build_attention_map(self.real_A)
+            return
 
         if is_warmup:
             self._set_trainable(self.netG, True)
             self._set_trainable(self.netGen, True)
-            self._set_trainable(self.netA, False)
-            self._set_trainable(self.netVStruct, False)
+            self._set_trainable(self.netPhi, False)
+            if self.netVStruct is not None:
+                self._set_trainable(self.netVStruct, False)
             result = self._unpaired_step(self.real_A, self.real_B, use_structure=False)
             self.fake_B = result["fake_B"].detach()
             self.loss_D_real = result["loss_D_real"]
@@ -568,11 +831,11 @@ class DualVelocityStructModel(BaseModel):
             self.loss_G_vs = result["loss_G_vs"]
             self.loss_G_ortho = result["loss_G_ortho"]
             self.loss_G_pair = result["loss_G_pair"]
+            self.loss_G_v0_match = result["loss_G_v0_match"]
+            self.loss_G_phi_pair = result["loss_G_phi_pair"]
             self.loss_G_total = result["loss_G_total"]
             if self.opt.log_attention_map:
-                with torch.no_grad():
-                    latent_A_vis, _, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
-                    self.attn_map = self._build_attention_map(latent_A_vis)
+                self.attn_map = self._build_attention_map(self.real_A)
             return
 
         paired_mask = self.is_paired
@@ -582,8 +845,9 @@ class DualVelocityStructModel(BaseModel):
         if unpaired_mask.any():
             self._set_trainable(self.netG, True)
             self._set_trainable(self.netGen, True)
-            self._set_trainable(self.netA, False)
-            self._set_trainable(self.netVStruct, True)
+            self._set_trainable(self.netPhi, False)
+            if self.netVStruct is not None:
+                self._set_trainable(self.netVStruct, True)
             unpaired_result = self._unpaired_step(self.real_A[unpaired_mask], self.real_B[unpaired_mask], use_structure=True)
             fake_for_visual = unpaired_result["fake_B"].detach()
             self.loss_D_real = unpaired_result["loss_D_real"]
@@ -595,6 +859,8 @@ class DualVelocityStructModel(BaseModel):
             self.loss_G_path = unpaired_result["loss_G_path"]
             self.loss_G_vs = unpaired_result["loss_G_vs"]
             self.loss_G_ortho = unpaired_result["loss_G_ortho"]
+            self.loss_G_v0_match = unpaired_result["loss_G_v0_match"]
+            self.loss_G_phi_pair = unpaired_result["loss_G_phi_pair"]
             self.loss_G_total = unpaired_result["loss_G_total"]
 
         if paired_mask.any() and self.opt.use_structure_attention:
@@ -602,10 +868,14 @@ class DualVelocityStructModel(BaseModel):
             self.loss_G_pair = paired_result["loss_G_pair"]
             self.loss_G_vs = self.loss_G_vs + paired_result["loss_G_vs"]
             self.loss_G_ortho = self.loss_G_ortho + paired_result["loss_G_ortho"]
+            self.loss_G_v0_match = self.loss_G_v0_match + paired_result["loss_G_v0_match"]
+            self.loss_G_phi_pair = self.loss_G_phi_pair + paired_result["loss_G_phi_pair"]
             self.loss_G_total = self.loss_G_total + (
                 self.opt.lambda_pair * paired_result["loss_G_pair"]
                 + self.opt.lambda_vs * paired_result["loss_G_vs"]
-                + self.opt.lambda_ortho * paired_result["loss_G_ortho"]
+                + self.ortho_weight * paired_result["loss_G_ortho"]
+                + self.opt.lambda_v0_match * paired_result["loss_G_v0_match"]
+                + self.opt.lambda_phi_pair * paired_result["loss_G_phi_pair"]
             )
 
         if fake_for_visual is None:
@@ -615,33 +885,40 @@ class DualVelocityStructModel(BaseModel):
             self.rec_A = self.real_A.detach()
             self.idt_B = self.real_B.detach()
             if self.opt.log_attention_map:
-                with torch.no_grad():
-                    latent_A_vis, _, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
-                    self.attn_map = self._build_attention_map(latent_A_vis)
+                self.attn_map = self._build_attention_map(self.real_A)
 
     @torch.no_grad()
     def translate(self, x, *_unused):
         was_training = self.netG.training
         self.netG.eval()
         self.netGen.eval()
-        self.netA.eval()
-        self.netVStruct.eval()
+        self.netPhi.eval()
+        if self.netVStruct is not None:
+            self.netVStruct.eval()
 
         netG = self._unwrap_module(self.netG)
         netGen = self._unwrap_module(self.netGen)
-        netA = self._unwrap_module(self.netA)
-        netVStruct = self._unwrap_module(self.netVStruct)
+        netPhi = self._unwrap_module(self.netPhi)
+        netVStruct = self._unwrap_module(self.netVStruct) if self.netVStruct is not None else None
 
         latent = netG(x, [], "encode")
-        latents_fake, _, _ = self.inference(latent, use_structure=True, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+        latents_fake, _, _ = self.inference(
+            latent,
+            source_images=x,
+            use_structure=True,
+            net_gen=netGen,
+            net_a=netPhi,
+            net_v_struct=netVStruct,
+        )
         domain = torch.full((latents_fake.size(0), 1), 1.0, device=latents_fake.device, dtype=latents_fake.dtype)
         out = netG((latents_fake, domain), [], "decode")
 
         if was_training:
             self.netG.train()
             self.netGen.train()
-            self.netA.train()
-            self.netVStruct.train()
+            self.netPhi.train()
+            if self.netVStruct is not None:
+                self.netVStruct.train()
         return out
 
     @torch.no_grad()
@@ -653,18 +930,26 @@ class DualVelocityStructModel(BaseModel):
 
         self.netG.eval()
         self.netGen.eval()
-        self.netA.eval()
-        self.netVStruct.eval()
+        self.netPhi.eval()
+        if self.netVStruct is not None:
+            self.netVStruct.eval()
         netG = self._unwrap_module(self.netG)
         netGen = self._unwrap_module(self.netGen)
-        netA = self._unwrap_module(self.netA)
-        netVStruct = self._unwrap_module(self.netVStruct)
+        netPhi = self._unwrap_module(self.netPhi)
+        netVStruct = self._unwrap_module(self.netVStruct) if self.netVStruct is not None else None
 
         interps = []
         for i in range(min(x.size(0), 2)):
             latent = netG(x[i].unsqueeze(0), [], "encode")
             steps = max(1, int(self.opt.ode_steps))
-            states = self._integrate_latent_async_for_vis(latent, steps, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+            states = self._integrate_latent_async_for_vis(
+                latent,
+                x[i].unsqueeze(0),
+                steps,
+                net_gen=netGen,
+                net_a=netPhi,
+                net_v_struct=netVStruct,
+            )
             picks = torch.linspace(0, len(states) - 1, steps=6).long().tolist()
             snaps = []
             for idx in picks:
@@ -674,20 +959,22 @@ class DualVelocityStructModel(BaseModel):
 
         self.netG.train()
         self.netGen.train()
-        self.netA.train()
-        self.netVStruct.train()
+        self.netPhi.train()
+        if self.netVStruct is not None:
+            self.netVStruct.train()
         return interps
 
     @torch.no_grad()
     def sample(self, x_a, x_b):
         self.netG.eval()
         self.netGen.eval()
-        self.netA.eval()
-        self.netVStruct.eval()
+        self.netPhi.eval()
+        if self.netVStruct is not None:
+            self.netVStruct.eval()
         netG = self._unwrap_module(self.netG)
         netGen = self._unwrap_module(self.netGen)
-        netA = self._unwrap_module(self.netA)
-        netVStruct = self._unwrap_module(self.netVStruct)
+        netPhi = self._unwrap_module(self.netPhi)
+        netVStruct = self._unwrap_module(self.netVStruct) if self.netVStruct is not None else None
 
         if self.opt.direction == "BtoA":
             x_a, x_b = x_b, x_a
@@ -702,7 +989,14 @@ class DualVelocityStructModel(BaseModel):
             d1 = torch.full((h_b.size(0), 1), 1.0, device=h_b.device, dtype=h_b.dtype)
             x_a_recon.append(netG((h_a, d0), [], "decode"))
             x_b_recon.append(netG((h_b, d1), [], "decode"))
-            h_ab, _, _ = self.inference(h_a, use_structure=True, net_gen=netGen, net_a=netA, net_v_struct=netVStruct)
+            h_ab, _, _ = self.inference(
+                h_a,
+                source_images=x_a[i].unsqueeze(0),
+                use_structure=True,
+                net_gen=netGen,
+                net_a=netPhi,
+                net_v_struct=netVStruct,
+            )
             d1_ab = torch.full((h_ab.size(0), 1), 1.0, device=h_ab.device, dtype=h_ab.dtype)
             x_ab.append(netG((h_ab, d1_ab), [], "decode"))
 
@@ -712,6 +1006,7 @@ class DualVelocityStructModel(BaseModel):
 
         self.netG.train()
         self.netGen.train()
-        self.netA.train()
-        self.netVStruct.train()
+        self.netPhi.train()
+        if self.netVStruct is not None:
+            self.netVStruct.train()
         return x_a, x_a_recon, x_ab, x_b, x_b_recon

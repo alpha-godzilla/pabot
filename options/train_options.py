@@ -42,6 +42,14 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--lr_policy', type=str, default='linear', help='learning rate policy. [linear | step | plateau | cosine]')
         parser.add_argument('--lr_decay_iters', type=int, default=50, help='multiply by a gamma every lr_decay_iters iterations')
 
+        # wandb logging (optional)
+        parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
+        parser.add_argument('--wandb_project', type=str, default='PaBoT', help='wandb project name')
+        parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity/team (optional)')
+        parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name (defaults to opt.name)')
+        parser.add_argument('--wandb_mode', type=str, default='online', choices=['online', 'offline', 'disabled'],
+                            help='wandb mode')
+
 
         
 

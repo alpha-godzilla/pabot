@@ -11,6 +11,22 @@ import os
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
+    wandb_run = None
+    if getattr(opt, "use_wandb", False):
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=opt.wandb_project,
+                entity=opt.wandb_entity,
+                name=opt.wandb_run_name or opt.name,
+                mode=opt.wandb_mode,
+                config=vars(opt),
+            )
+            print(f'W&B enabled: run={wandb_run.name}')
+        except ImportError:
+            print('Warning: wandb is not installed. Install with: pip install wandb')
+            wandb_run = None
+
     num_gpus = len(opt.gpu_ids)
     if num_gpus > 1 and opt.batch_size < num_gpus:
         raise ValueError(
@@ -97,6 +113,15 @@ if __name__ == '__main__':
                 visualizer.print_current_losses(epoch, epoch_iter, losses, optimize_time, t_data)
                 if opt.display_id is None or opt.display_id > 0:
                     visualizer.plot_current_losses(epoch, float(epoch_iter) / dataset_size, losses)
+                if wandb_run is not None:
+                    wandb_run.log({
+                        **{f"train/{k}": float(v) for k, v in losses.items()},
+                        "train/epoch": int(epoch),
+                        "train/epoch_iter": int(epoch_iter),
+                        "train/total_iters": int(total_iters),
+                        "train/optimize_time": float(optimize_time),
+                        "train/data_time": float(t_data),
+                    }, step=int(total_iters))
 
             if total_iters % opt.save_latest_freq == 0:   # cache our latest model every <save_latest_freq> iterations
                 print('saving the latest model (epoch %d, total_iters %d)' % (epoch, total_iters))
@@ -125,10 +150,25 @@ if __name__ == '__main__':
                 val_src, val_tgt = val_loader_a, val_loader_b
             results = eval_val_metrics(model, val_src, val_tgt, lpips_fn)
             test_logger.log(epoch, opt.n_epochs + opt.n_epochs_decay, results, verbose=True)
+            if wandb_run is not None:
+                wandb_run.log({
+                    **{f"val/{k}": float(v) for k, v in results.items()},
+                    "val/epoch": int(epoch),
+                }, step=int(total_iters))
             if results['PSNR'] > best_psnr:
                 best_psnr = results['PSNR']
                 model.save_networks('best')
                 test_logger.log_message('==> Best PSNR: %.3f at epoch %d, saving best model' % (best_psnr, epoch))
+            if wandb_run is not None:
+                wandb_run.log({"val/best_psnr": float(best_psnr)}, step=int(total_iters))
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
         model.update_learning_rate()                     # update learning rates at the end of every epoch.
+        if wandb_run is not None and len(model.optimizers) > 0:
+            wandb_run.log({
+                "train/lr": float(model.optimizers[0].param_groups[0]["lr"]),
+                "train/epoch_end": int(epoch),
+            }, step=int(total_iters))
+
+    if wandb_run is not None:
+        wandb_run.finish()

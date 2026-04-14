@@ -95,6 +95,27 @@ python train.py \
 ```
 
 ```bash
+# Perturbation-induced structural flow with ViT attention features
+python train.py \
+  --dataroot ./datasets/Head \
+  --direction BtoA \
+  --model dual_velocity_struct \
+  --struct_velocity_mode perturb \
+  --a_backbone vit \
+  --struct_channels 64 \
+  --ode_steps 4 \
+  --perturb_eps 0.02 \
+  --perturb_samples 1 \
+  --struct_grad_scale 0.1 \
+  --lambda_path 0.1 \
+  --lambda_pair 1.0 \
+  --lambda_vs 0.01 \
+  --lambda_ortho 0.01 \
+  --perturb_ortho_scale 0.1 \
+  --tag dual_velocity_struct_perturb
+```
+
+```bash
 # Multi-GPU example (DataParallel)
 python train.py \
   --dataroot ./datasets/Head \
