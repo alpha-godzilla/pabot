@@ -10,6 +10,31 @@ from pathlib import Path
 from typing import Dict, List, Optional, TextIO
 
 
+try:
+    BooleanOptionalAction = argparse.BooleanOptionalAction
+except AttributeError:
+    class BooleanOptionalAction(argparse.Action):
+        """Compat action for Python < 3.9 that supports --foo/--no-foo."""
+
+        def __init__(self, option_strings, dest, default=None, required=False, help=None):
+            expanded = []
+            for opt in option_strings:
+                expanded.append(opt)
+                if opt.startswith("--"):
+                    expanded.append(f"--no-{opt[2:]}")
+            super().__init__(
+                option_strings=expanded,
+                dest=dest,
+                nargs=0,
+                default=default,
+                required=required,
+                help=help,
+            )
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not str(option_string).startswith("--no-"))
+
+
 @dataclass
 class Job:
     name: str
@@ -44,6 +69,8 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
         "{gpu_id}",
         "--batch_size",
         str(args.batch_size),
+        "--epoch",
+        args.epoch,
         "--n_epochs",
         str(args.n_epochs),
         "--n_epochs_decay",
@@ -98,8 +125,6 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
         args.preprocess,
         "--random_scale_max",
         str(args.random_scale_max),
-        "--max_dataset_size",
-        args.max_dataset_size,
         "--style_dim",
         str(args.style_dim),
         "--stylegan2_G_num_downsampling",
@@ -169,6 +194,9 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
     if args.continue_train:
         common.append("--continue_train")
 
+    if args.max_dataset_size is not None:
+        common.extend(["--max_dataset_size", str(args.max_dataset_size)])
+
     if args.no_flip:
         common.append("--no_flip")
     if args.no_dropout:
@@ -212,6 +240,7 @@ def main() -> int:
     parser.add_argument("--dataroot", default="/home/ljc/code/PaBoT-main/datasets")
     parser.add_argument("--base_name", default="dual_dino_phi_fresh_sweep", help="Base experiment name; suffixes are appended automatically")
     parser.add_argument("--tag", default="dual_dino_phi_sweep")
+    parser.add_argument("--epoch", default="100", help="Which checkpoint epoch to load when continue_train is enabled; use latest to resume from the most recent save")
     parser.add_argument("--gpu_ids", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids used as a scheduling pool")
     parser.add_argument(
         "--train_gpu_ids",
@@ -229,7 +258,7 @@ def main() -> int:
     parser.add_argument("--model", default="dual_velocity_struct")
     parser.add_argument("--dataset_mode", default="unaligned")
     parser.add_argument("--direction", default="BtoA")
-    parser.add_argument("--controlled_pairing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--controlled_pairing", action=BooleanOptionalAction, default=True)
     parser.add_argument("--paired_ratio", type=float, default=0.1)
     parser.add_argument("--pair_seed", type=int, default=3407)
     parser.add_argument("--a_backbone", default="vit")
@@ -251,18 +280,18 @@ def main() -> int:
     parser.add_argument("--crop_size", type=int, default=256)
     parser.add_argument("--preprocess", default="resize_and_crop")
     parser.add_argument("--random_scale_max", type=float, default=3.0)
-    parser.add_argument("--max_dataset_size", default="inf")
+    parser.add_argument("--max_dataset_size", type=int, default=None, help="Optional integer cap for dataset size. If omitted, train.py default is used.")
     parser.add_argument("--style_dim", type=int, default=8)
     parser.add_argument("--stylegan2_G_num_downsampling", type=int, default=1)
     parser.add_argument("--ode_steps", type=int, default=4)
     parser.add_argument("--struct_channels", type=int, default=64)
     parser.add_argument("--phi_hidden_channels", type=int, default=32)
     parser.add_argument("--struct_velocity_mode", default="learned")
-    parser.add_argument("--use_structure_attention", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_structure_attention", action=BooleanOptionalAction, default=True)
     parser.add_argument("--structure_attention_source", default="rollout")
     parser.add_argument("--noise_std", type=float, default=1.0)
     parser.add_argument("--struct_grad_scale", type=float, default=0.1)
-    parser.add_argument("--log_attention_map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log_attention_map", action=BooleanOptionalAction, default=True)
     parser.add_argument("--lambda_pair", type=float, default=1.0)
     parser.add_argument("--lambda_path", type=float, default=0.1)
     parser.add_argument("--lambda_vs", type=float, default=0.01)
@@ -273,15 +302,16 @@ def main() -> int:
     parser.add_argument("--lambda_rec", type=float, default=5.0)
     parser.add_argument("--lambda_phi_attn", type=float, default=1.0)
     parser.add_argument("--warmup_epochs", type=int, default=0)
-    parser.add_argument("--v0_stopgrad_phi", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--use_wandb", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--v0_stopgrad_phi", action=BooleanOptionalAction, default=True)
+    parser.add_argument("--use_wandb", action=BooleanOptionalAction, default=False)
     parser.add_argument("--wandb_project", default="PaBoT")
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_mode", default="online")
-    parser.add_argument("--no_flip", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--no_dropout", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--use_cam_weight", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--continue_train", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--no_flip", action=BooleanOptionalAction, default=False)
+    parser.add_argument("--no_dropout", action=BooleanOptionalAction, default=True)
+    parser.add_argument("--use_cam_weight", action=BooleanOptionalAction, default=False)
+    parser.add_argument("--continue_train", action=BooleanOptionalAction, default=False)
+    parser.add_argument("--resume_checkpoints_dir", default=None, help="Use an existing checkpoints directory instead of creating a new timestamped sweep root")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -305,6 +335,8 @@ def main() -> int:
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.checkpoints_dir) / f"{args.base_name}_{timestamp}"
+    if args.resume_checkpoints_dir:
+        run_root = Path(args.resume_checkpoints_dir)
     log_dir = Path("logs") / f"{args.base_name}_{timestamp}"
     log_dir.mkdir(parents=True, exist_ok=True)
 
