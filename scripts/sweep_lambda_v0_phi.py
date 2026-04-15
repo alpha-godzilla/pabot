@@ -51,6 +51,47 @@ def parse_float_list(raw_values: List[str]) -> List[float]:
     return [float(value) for value in raw_values]
 
 
+def normalize_bool_cli_args(argv: List[str], bool_option_names: List[str]) -> List[str]:
+    """Normalize '--flag true/false' into '--flag'/'--no-flag' for argparse bool options."""
+    true_values = {"1", "true", "t", "yes", "y", "on"}
+    false_values = {"0", "false", "f", "no", "n", "off"}
+    bool_set = set(bool_option_names)
+    normalized: List[str] = []
+
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+
+        if token.startswith("--") and "=" in token:
+            key, value = token.split("=", 1)
+            if key in bool_set:
+                v = value.strip().lower()
+                if v in true_values:
+                    normalized.append(key)
+                    i += 1
+                    continue
+                if v in false_values:
+                    normalized.append(f"--no-{key[2:]}")
+                    i += 1
+                    continue
+
+        if token in bool_set and i + 1 < len(argv):
+            nxt = argv[i + 1].strip().lower()
+            if nxt in true_values:
+                normalized.append(token)
+                i += 2
+                continue
+            if nxt in false_values:
+                normalized.append(f"--no-{token[2:]}")
+                i += 2
+                continue
+
+        normalized.append(token)
+        i += 1
+
+    return normalized
+
+
 def build_common_train_args(args: argparse.Namespace) -> List[str]:
     common = [
         "--dataroot",
@@ -163,6 +204,8 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
         str(args.lambda_rec),
         "--warmup_epochs",
         str(args.warmup_epochs),
+        "--phi_pretrain_epochs",
+        str(args.phi_pretrain_epochs),
         "--lambda_v0_match",
         "{lambda_v0_match}",
         "--lambda_phi_pair",
@@ -194,6 +237,9 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
 
     if args.max_dataset_size is not None:
         common.extend(["--max_dataset_size", str(args.max_dataset_size)])
+
+    if args.phi_pretrain_max_epochs is not None:
+        common.extend(["--phi_pretrain_max_epochs", str(args.phi_pretrain_max_epochs)])
 
     if args.no_flip:
         common.append("--no_flip")
@@ -299,6 +345,8 @@ def main() -> int:
     parser.add_argument("--lambda_rec", type=float, default=5.0)
     parser.add_argument("--lambda_phi_attn", type=float, default=1.0)
     parser.add_argument("--warmup_epochs", type=int, default=0)
+    parser.add_argument("--phi_pretrain_epochs", type=int, default=5)
+    parser.add_argument("--phi_pretrain_max_epochs", type=int, default=None)
     parser.add_argument("--v0_stopgrad_phi", action=BooleanOptionalAction, default=True)
     parser.add_argument("--use_wandb", action=BooleanOptionalAction, default=False)
     parser.add_argument("--wandb_project", default="PaBoT")
@@ -309,7 +357,19 @@ def main() -> int:
     parser.add_argument("--use_cam_weight", action=BooleanOptionalAction, default=False)
     parser.add_argument("--continue_train", action=BooleanOptionalAction, default=False)
     parser.add_argument("--dry_run", action="store_true")
-    args = parser.parse_args()
+    bool_option_names = [
+        "--controlled_pairing",
+        "--use_structure_attention",
+        "--log_attention_map",
+        "--v0_stopgrad_phi",
+        "--use_wandb",
+        "--no_flip",
+        "--no_dropout",
+        "--use_cam_weight",
+        "--continue_train",
+    ]
+    normalized_argv = normalize_bool_cli_args(sys.argv[1:], bool_option_names)
+    args = parser.parse_args(normalized_argv)
 
     gpu_pool = [gpu.strip() for gpu in args.gpu_ids.split(",") if gpu.strip()]
     if not gpu_pool:
