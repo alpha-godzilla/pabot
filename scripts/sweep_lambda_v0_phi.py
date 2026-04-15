@@ -69,8 +69,6 @@ def build_common_train_args(args: argparse.Namespace) -> List[str]:
         "{gpu_id}",
         "--batch_size",
         str(args.batch_size),
-        "--epoch",
-        args.epoch,
         "--n_epochs",
         str(args.n_epochs),
         "--n_epochs_decay",
@@ -240,7 +238,6 @@ def main() -> int:
     parser.add_argument("--dataroot", default="/home/ljc/code/PaBoT-main/datasets")
     parser.add_argument("--base_name", default="dual_dino_phi_fresh_sweep", help="Base experiment name; suffixes are appended automatically")
     parser.add_argument("--tag", default="dual_dino_phi_sweep")
-    parser.add_argument("--epoch", default="100", help="Which checkpoint epoch to load when continue_train is enabled; use latest to resume from the most recent save")
     parser.add_argument("--gpu_ids", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids used as a scheduling pool")
     parser.add_argument(
         "--train_gpu_ids",
@@ -311,7 +308,6 @@ def main() -> int:
     parser.add_argument("--no_dropout", action=BooleanOptionalAction, default=True)
     parser.add_argument("--use_cam_weight", action=BooleanOptionalAction, default=False)
     parser.add_argument("--continue_train", action=BooleanOptionalAction, default=False)
-    parser.add_argument("--resume_checkpoints_dir", default=None, help="Use an existing checkpoints directory instead of creating a new timestamped sweep root")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -335,8 +331,6 @@ def main() -> int:
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.checkpoints_dir) / f"{args.base_name}_{timestamp}"
-    if args.resume_checkpoints_dir:
-        run_root = Path(args.resume_checkpoints_dir)
     log_dir = Path("logs") / f"{args.base_name}_{timestamp}"
     log_dir.mkdir(parents=True, exist_ok=True)
 
