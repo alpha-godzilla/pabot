@@ -137,9 +137,12 @@ if __name__ == '__main__':
             images = model.sample(fix_a, fix_b)
             write_images(images, opt.display_size, opt.img_dir, postfix='%03d_sample' % epoch)
 
-        if epoch % opt.save_epoch_freq == 0:              # cache our model every <save_epoch_freq> epochs
-            print('saving the model at the end of epoch %d, iters %d' % (epoch, total_iters))
-            model.save_networks('latest')
+        # Save latest at every epoch end for reliable resume, and keep numbered
+        # snapshots only every <save_epoch_freq> epochs to control disk usage.
+        print('saving latest model at the end of epoch %d, iters %d' % (epoch, total_iters))
+        model.save_networks('latest')
+        if epoch % max(1, int(opt.save_epoch_freq)) == 0:
+            print('saving epoch checkpoint at epoch %d, iters %d' % (epoch, total_iters))
             model.save_networks(epoch)
 
         # Evaluate PSNR / SSIM / LPIPS on the validation set
