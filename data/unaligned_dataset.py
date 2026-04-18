@@ -42,6 +42,25 @@ class UnalignedDataset(BaseDataset):
         pair_base_size = min(self.A_size, self.B_size)
         self.paired_cutoff = max(0, min(pair_base_size, int(self.paired_ratio * pair_base_size)))
 
+    def _is_phi_pretrain_stage(self):
+        if not bool(getattr(self.opt, "isTrain", False)):
+            return False
+        if not self.controlled_pairing:
+            return False
+
+        epoch_count = int(getattr(self.opt, "epoch_count", 1))
+        stage_epoch = max(0, int(self.current_epoch) - epoch_count)
+
+        phi_pretrain_epochs = int(getattr(self.opt, "phi_pretrain_epochs", 0))
+        phi_pretrain_max_epochs = getattr(self.opt, "phi_pretrain_max_epochs", None)
+        if phi_pretrain_max_epochs is None:
+            max_phi_epochs = phi_pretrain_epochs
+        else:
+            max_phi_epochs = int(phi_pretrain_max_epochs)
+        max_phi_epochs = max(0, max_phi_epochs)
+
+        return stage_epoch < max_phi_epochs
+
     def __getitem__(self, index):
         """Return a data point and its metadata information.
 
@@ -54,8 +73,16 @@ class UnalignedDataset(BaseDataset):
             A_paths (str)    -- image paths
             B_paths (str)    -- image paths
         """
-        A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
-        if self.controlled_pairing:
+        in_phi_stage = self._is_phi_pretrain_stage()
+
+        if in_phi_stage and self.paired_cutoff > 0:
+            # During phi pretraining, sample only from the paired prefix.
+            paired_index = index % self.paired_cutoff
+            A_path = self.A_paths[paired_index]
+            index_B = paired_index % self.B_size
+            is_paired = True
+        elif self.controlled_pairing:
+            A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
             # Front paired_ratio samples are strictly paired; the rest are reproducibly unpaired.
             is_paired = (index % self.A_size) < self.paired_cutoff and (index % self.A_size) < self.B_size
             if is_paired:
@@ -65,9 +92,11 @@ class UnalignedDataset(BaseDataset):
                 rng = random.Random(self.pair_seed + self.current_epoch * 1000003 + index)
                 index_B = rng.randint(unpaired_low, self.B_size - 1)
         elif self.opt.serial_batches:   # make sure index is within then range
+            A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
             index_B = index % self.B_size
             is_paired = True
         else:   # randomize the index for domain B to avoid fixed pairs.
+            A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
             index_B = random.randint(0, self.B_size - 1)
             is_paired = False
         B_path = self.B_paths[index_B]
@@ -92,4 +121,7 @@ class UnalignedDataset(BaseDataset):
         As we have two datasets with potentially different number of images,
         we take a maximum of
         """
+        if self._is_phi_pretrain_stage() and self.paired_cutoff > 0:
+            # Keep at least one full batch to avoid zero-iteration epochs with drop_last=True.
+            return max(self.paired_cutoff, int(getattr(self.opt, "batch_size", 1)))
         return max(self.A_size, self.B_size)

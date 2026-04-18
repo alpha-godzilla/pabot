@@ -1,12 +1,13 @@
 import time
 import torch
+import os
+import re
 from options.train_options import TrainOptions
 from data import create_dataset, get_test_loaders, get_val_loaders
 from models import create_model
 from util.visualizer import Visualizer
 from util.util import write_images
 from models.utils import eval_loader, eval_val_metrics, SimpleLogger
-import os
 
 
 if __name__ == '__main__':
@@ -67,6 +68,42 @@ if __name__ == '__main__':
         print('Warning: lpips not installed, LPIPS will be skipped. Install with: pip install lpips')
         lpips_fn = None
     best_psnr = 0.0
+    best_phi_mse = None
+    best_phi_epoch = None
+    best_phi_applied = False
+
+    def _scan_best_phi_mse_from_phase_states(run_dir):
+        phase_pat = re.compile(r"^(\d+)_phase_state\.pth$")
+        best_epoch_local = None
+        best_mse_local = None
+        if not os.path.isdir(run_dir):
+            return best_epoch_local, best_mse_local
+        for fname in os.listdir(run_dir):
+            m = phase_pat.match(fname)
+            if m is None:
+                continue
+            path = os.path.join(run_dir, fname)
+            try:
+                state = torch.load(path, map_location="cpu")
+            except Exception:
+                continue
+            mse = state.get("phi_epoch_mse_loss", None)
+            if mse is None:
+                continue
+            try:
+                mse = float(mse)
+            except (TypeError, ValueError):
+                continue
+            ep = int(m.group(1))
+            if best_mse_local is None or mse < best_mse_local:
+                best_mse_local = mse
+                best_epoch_local = ep
+        return best_epoch_local, best_mse_local
+
+    if bool(getattr(opt, "continue_train", False)):
+        best_phi_epoch, best_phi_mse = _scan_best_phi_mse_from_phase_states(opt.run_dir)
+        if best_phi_mse is not None:
+            print(f"[resume] current best phi-epoch-mse from history: epoch={best_phi_epoch}, mse={best_phi_mse:.6f}")
 
     optimize_time = 0.1
 
@@ -76,6 +113,9 @@ if __name__ == '__main__':
         iter_data_time = time.time()    # timer for data loading per iteration
         epoch_iter = 0                  # the number of training iterations in current epoch, reset to 0 every epoch
         visualizer.reset()              # reset the visualizer: make sure it saves the results to HTML at least once every epoch
+        phi_step_count = 0
+        phi_sample_count = 0
+        phi_opt_time_sum = 0.0
 
         dataset.set_epoch(epoch)
         model.set_epoch(epoch)
@@ -99,7 +139,13 @@ if __name__ == '__main__':
             model.optimize_parameters()   # calculate loss functions, get gradients, update network weights
             if len(opt.gpu_ids) > 0:
                 torch.cuda.synchronize()
+            step_opt_time = time.time() - optimize_start_time
             optimize_time = (time.time() - optimize_start_time) / batch_size * 0.005 + 0.995 * optimize_time
+
+            if bool(getattr(model, "is_phi_pretrain_stage", False)):
+                phi_step_count += 1
+                phi_sample_count += int(batch_size)
+                phi_opt_time_sum += float(step_opt_time)
 
 
             if total_iters % opt.display_freq == 0:   # display images on visdom and save images to a HTML file
@@ -145,6 +191,31 @@ if __name__ == '__main__':
             print('saving epoch checkpoint at epoch %d, iters %d' % (epoch, total_iters))
             model.save_networks(epoch)
 
+        # Track best phi by minimum epoch-MSE of phi loss during phi pretraining stage.
+        stage_epoch = max(0, int(epoch) - int(getattr(opt, "epoch_count", 1)))
+        phi_pretrain_epochs = int(getattr(opt, "phi_pretrain_epochs", 0))
+        phi_pretrain_max_epochs = getattr(opt, "phi_pretrain_max_epochs", None)
+        if phi_pretrain_max_epochs is None:
+            max_phi_epochs = phi_pretrain_epochs
+        else:
+            max_phi_epochs = int(phi_pretrain_max_epochs)
+        max_phi_epochs = max(0, max_phi_epochs)
+        in_phi_stage = stage_epoch < max_phi_epochs
+
+        phi_epoch_mse = model.get_phi_epoch_mse_loss() if hasattr(model, "get_phi_epoch_mse_loss") else None
+        if in_phi_stage and phi_epoch_mse is not None:
+            if best_phi_mse is None or float(phi_epoch_mse) < float(best_phi_mse):
+                best_phi_mse = float(phi_epoch_mse)
+                best_phi_epoch = int(epoch)
+                model.save_networks('best_phi')
+                print('==> Best Phi MSE: %.6f at epoch %d, saving best_phi model' % (best_phi_mse, best_phi_epoch))
+
+        # Right after finishing phi-pretrain (e.g., phi50), swap to best_phi for warmup/normal stages.
+        if (not in_phi_stage) and (not best_phi_applied) and best_phi_epoch is not None and max_phi_epochs > 0:
+            print('loading best_phi checkpoint (epoch %d) for post-phi stages' % best_phi_epoch)
+            model.load_networks('best_phi')
+            best_phi_applied = True
+
         # Evaluate PSNR / SSIM / LPIPS on the validation set
         if epoch % opt.eval_epoch_freq == 0:
             if opt.direction == 'BtoA':
@@ -166,6 +237,13 @@ if __name__ == '__main__':
                 wandb_run.log({"val/best_psnr": float(best_psnr)}, step=int(total_iters))
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
+        if phi_step_count > 0:
+            phi_avg_step = phi_opt_time_sum / max(1, phi_step_count)
+            phi_sps = phi_sample_count / max(1e-8, phi_opt_time_sum)
+            print(
+                '[phi-speed] epoch %d: steps=%d, samples=%d, avg_step=%.4fs, throughput=%.2f samples/s'
+                % (epoch, phi_step_count, phi_sample_count, phi_avg_step, phi_sps)
+            )
         model.update_learning_rate()                     # update learning rates at the end of every epoch.
         if wandb_run is not None and len(model.optimizers) > 0:
             wandb_run.log({

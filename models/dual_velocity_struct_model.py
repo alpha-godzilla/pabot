@@ -1,6 +1,7 @@
 import itertools
 import math
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -202,6 +203,8 @@ class DualVelocityStructModel(BaseModel):
                             help="stop phi pretraining early when EMA phi loss <= threshold; negative disables")
         parser.add_argument("--phi_pretrain_ema_momentum", type=float, default=0.9,
                             help="EMA momentum used for phi loss early-stop tracking")
+        parser.add_argument("--auto_load_best_phi", type=util.str2bool, nargs="?", const=True, default=True,
+                    help="when resuming, replace netPhi with checkpoint from epoch having minimum phi_pretrain_ema_loss")
         parser.add_argument("--dino_model_name", type=str, default="dino_vitb8",
                             help="torch.hub DINO model name")
         parser.add_argument("--dino_image_size", type=int, default=224,
@@ -294,6 +297,8 @@ class DualVelocityStructModel(BaseModel):
             image_size=opt.dino_image_size,
         ).to(self.device)
         self.dino_extractor.eval()
+        for param in self.dino_extractor.parameters():
+            param.requires_grad = False
         if self.use_learned_struct:
             self.netVStruct = networks.init_net(
                 StructureVelocityGenerator(latent_channels + 1, latent_channels, hidden_channels=max(64, opt.ngf * 2)),
@@ -346,6 +351,12 @@ class DualVelocityStructModel(BaseModel):
         self._init_loss_tensors()
         self.phi_pretrain_end_stage_epoch = None
         self.phi_pretrain_ema_loss = None
+        self.phi_epoch_avg_loss = None
+        self.phi_epoch_mse_loss = None
+        self._phi_epoch_loss_sum = 0.0
+        self._phi_epoch_loss_sq_sum = 0.0
+        self._phi_epoch_loss_count = 0
+        self.is_phi_pretrain_stage = False
 
     def _phase_state_path(self, epoch):
         return os.path.join(self.save_dir, f"{epoch}_phase_state.pth")
@@ -355,6 +366,8 @@ class DualVelocityStructModel(BaseModel):
         phase_state = {
             "phi_pretrain_end_stage_epoch": self.phi_pretrain_end_stage_epoch,
             "phi_pretrain_ema_loss": self.phi_pretrain_ema_loss,
+            "phi_epoch_avg_loss": self.phi_epoch_avg_loss,
+            "phi_epoch_mse_loss": self.phi_epoch_mse_loss,
         }
         torch.save(phase_state, self._phase_state_path(epoch))
 
@@ -365,6 +378,90 @@ class DualVelocityStructModel(BaseModel):
             phase_state = torch.load(phase_state_path, map_location=self.device)
             self.phi_pretrain_end_stage_epoch = phase_state.get("phi_pretrain_end_stage_epoch", None)
             self.phi_pretrain_ema_loss = phase_state.get("phi_pretrain_ema_loss", None)
+            self.phi_epoch_avg_loss = phase_state.get("phi_epoch_avg_loss", None)
+            self.phi_epoch_mse_loss = phase_state.get("phi_epoch_mse_loss", None)
+
+        if self.isTrain and bool(getattr(self.opt, "continue_train", False)) and bool(getattr(self.opt, "auto_load_best_phi", False)):
+            self._maybe_load_best_phi_by_phase_loss()
+
+    def set_epoch(self, epoch):
+        super().set_epoch(epoch)
+        self._phi_epoch_loss_sum = 0.0
+        self._phi_epoch_loss_sq_sum = 0.0
+        self._phi_epoch_loss_count = 0
+        self.phi_epoch_avg_loss = None
+        self.phi_epoch_mse_loss = None
+
+    def get_phi_epoch_avg_loss(self):
+        if self._phi_epoch_loss_count <= 0:
+            return None
+        return self._phi_epoch_loss_sum / float(self._phi_epoch_loss_count)
+
+    def get_phi_epoch_mse_loss(self):
+        if self._phi_epoch_loss_count <= 0:
+            return None
+        return self._phi_epoch_loss_sq_sum / float(self._phi_epoch_loss_count)
+
+    def _maybe_load_best_phi_by_phase_loss(self):
+        if self.opt.isTrain and self.opt.pretrained_name is not None:
+            load_dir = os.path.join(self.opt.checkpoints_dir, self.opt.pretrained_name)
+        else:
+            load_dir = self.save_dir
+
+        if not os.path.isdir(load_dir):
+            return
+
+        best_epoch = None
+        best_loss = None
+        best_loss_name = None
+        phase_pat = re.compile(r"^(\d+)_phase_state\.pth$")
+
+        for filename in os.listdir(load_dir):
+            match = phase_pat.match(filename)
+            if match is None:
+                continue
+
+            phase_path = os.path.join(load_dir, filename)
+            try:
+                state = torch.load(phase_path, map_location="cpu")
+            except Exception:
+                continue
+
+            loss = state.get("phi_epoch_mse_loss", None)
+            loss_name = "mse_loss"
+            if loss is None:
+                loss = state.get("phi_epoch_avg_loss", None)
+                loss_name = "avg_loss"
+            if loss is None:
+                loss = state.get("phi_pretrain_ema_loss", None)
+                loss_name = "ema_loss"
+            if loss is None:
+                continue
+            try:
+                loss = float(loss)
+            except (TypeError, ValueError):
+                continue
+
+            epoch = int(match.group(1))
+            phi_path = os.path.join(load_dir, f"{epoch}_net_Phi.pth")
+            if not os.path.exists(phi_path):
+                continue
+
+            if best_loss is None or loss < best_loss:
+                best_loss = loss
+                best_epoch = epoch
+                best_loss_name = loss_name
+
+        if best_epoch is None:
+            return
+
+        phi_path = os.path.join(load_dir, f"{best_epoch}_net_Phi.pth")
+        net_phi = self.netPhi.module if isinstance(self.netPhi, torch.nn.DataParallel) else self.netPhi
+        print(f"[resume] loading best-phi checkpoint from epoch={best_epoch}, {best_loss_name}={best_loss:.6f}: {phi_path}")
+        state_dict = torch.load(phi_path, map_location=str(self.device))
+        if hasattr(state_dict, "_metadata"):
+            del state_dict._metadata
+        net_phi.load_state_dict(state_dict)
 
     def _init_loss_tensors(self):
         zero = torch.tensor(0.0, device=self.device)
@@ -509,6 +606,7 @@ class DualVelocityStructModel(BaseModel):
         if not self.isTrain:
             return None
 
+        # Phi-only mode: all trainable modules except Phi are frozen.
         self._set_trainable(self.netG, False)
         self._set_trainable(self.netGen, False)
         self._set_trainable(self.netPhi, True)
@@ -516,7 +614,13 @@ class DualVelocityStructModel(BaseModel):
             self._set_trainable(self.netVStruct, False)
         self._set_trainable(self.netD, False)
 
-        self.optimizer_Phi.zero_grad()
+        # Ensure no stale gradients remain on non-Phi optimizers.
+        self.optimizer_gen.zero_grad(set_to_none=True)
+        self.optimizer_D.zero_grad(set_to_none=True)
+        if self.optimizer_V_struct is not None:
+            self.optimizer_V_struct.zero_grad(set_to_none=True)
+        self.optimizer_Phi.zero_grad(set_to_none=True)
+
         with torch.no_grad():
             attn_mri = self._extract_attention_map(images_A)
             attn_ct = self._extract_attention_map(images_B)
@@ -757,6 +861,7 @@ class DualVelocityStructModel(BaseModel):
 
     def optimize_parameters(self):
         self._init_loss_tensors()
+        self.is_phi_pretrain_stage = False
         epoch = int(self.get_epoch())
         stage_epoch = max(0, epoch - int(getattr(self.opt, "epoch_count", 1)))
 
@@ -786,6 +891,7 @@ class DualVelocityStructModel(BaseModel):
             )
 
         is_phi_pretrain = self.phi_pretrain_end_stage_epoch is None
+        self.is_phi_pretrain_stage = bool(is_phi_pretrain)
         if self.phi_pretrain_end_stage_epoch is None:
             phi_done_offset = 0
         else:
@@ -804,6 +910,11 @@ class DualVelocityStructModel(BaseModel):
                         self.phi_pretrain_ema_loss = phi_loss_val
                     else:
                         self.phi_pretrain_ema_loss = momentum * self.phi_pretrain_ema_loss + (1.0 - momentum) * phi_loss_val
+                    self._phi_epoch_loss_sum += phi_loss_val
+                    self._phi_epoch_loss_sq_sum += phi_loss_val * phi_loss_val
+                    self._phi_epoch_loss_count += 1
+                    self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
+                    self.phi_epoch_mse_loss = self.get_phi_epoch_mse_loss()
             self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
             self.loss_G_total = self.loss_G_phi_pair
             self.fake_B = self.real_B.detach()
