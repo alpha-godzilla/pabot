@@ -224,6 +224,16 @@ class DualVelocityStructModel(BaseModel):
                             help="torch.hub DINO model name")
         parser.add_argument("--dino_image_size", type=int, default=224,
                             help="input size used for frozen DINO attention extraction")
+        parser.add_argument("--dino_cache_dir", type=str, default="",
+                    help="optional directory storing per-image DINO attention cache (.pt)")
+        parser.add_argument("--dino_cache_rel_root", type=str, default="",
+                    help="root used to compute relative image keys for dino cache (default: dataroot)")
+        parser.add_argument("--dino_cache_strict", type=util.str2bool, nargs="?", const=True, default=False,
+                    help="if true, fail on cache miss instead of online DINO fallback")
+        parser.add_argument("--dino_cache_save_missing", type=util.str2bool, nargs="?", const=True, default=False,
+                    help="if true, save online-computed DINO attention to cache on misses")
+        parser.add_argument("--dino_cache_verbose", type=util.str2bool, nargs="?", const=True, default=False,
+                    help="print DINO cache hit/miss information")
         parser.add_argument("--tag", type=str, default="dual_velocity_struct", help="experiment tag")
 
         parser.set_defaults(no_html=True, pool_size=0, controlled_pairing=True, paired_ratio=0.1)
@@ -333,6 +343,23 @@ class DualVelocityStructModel(BaseModel):
         self.net_A = self.netPhi
         if self.netVStruct is not None:
             self.net_V_struct = self.netVStruct
+
+        self.dino_cache_dir = None
+        if str(getattr(self.opt, "dino_cache_dir", "")).strip():
+            self.dino_cache_dir = os.path.abspath(self.opt.dino_cache_dir)
+        cache_rel_root_opt = str(getattr(self.opt, "dino_cache_rel_root", "")).strip()
+        self.dino_cache_rel_root = os.path.abspath(cache_rel_root_opt) if cache_rel_root_opt else os.path.abspath(self.opt.dataroot)
+        self.dino_cache_strict = bool(getattr(self.opt, "dino_cache_strict", False))
+        self.dino_cache_save_missing = bool(getattr(self.opt, "dino_cache_save_missing", False))
+        self.dino_cache_verbose = bool(getattr(self.opt, "dino_cache_verbose", False))
+        if self.dino_cache_dir is not None and self.dino_cache_save_missing:
+            os.makedirs(self.dino_cache_dir, exist_ok=True)
+        if self.dino_cache_dir is not None and self.isTrain and (not bool(getattr(self.opt, "no_flip", True))):
+            print("[dino-cache] warning: no_flip=False may cause cache mismatch with online augmented inputs.")
+
+        self.batch_A_paths = []
+        self.batch_B_paths = []
+
         self.d_A = torch.zeros([1], device=self.device)
         self.d_B = torch.ones([1], device=self.device)
 
@@ -684,6 +711,8 @@ class DualVelocityStructModel(BaseModel):
         self.real_A = input["A" if AtoB else "B"].to(self.device)
         self.real_B = input["B" if AtoB else "A"].to(self.device)
         self.image_paths = input["A_paths" if AtoB else "B_paths"]
+        self.batch_A_paths = self._to_python_str_list(input.get("A_paths" if AtoB else "B_paths", None))
+        self.batch_B_paths = self._to_python_str_list(input.get("B_paths" if AtoB else "A_paths", None))
         self.patient_ids = self._to_python_str_list(input.get("patient_id", None))
         self.slice_indices = self._to_long_tensor(input.get("slice_idx", None), device=self.device)
         is_paired = input.get("is_paired", None)
@@ -705,6 +734,17 @@ class DualVelocityStructModel(BaseModel):
         patient_ids = [self.patient_ids[idx] for idx in indices] if self.patient_ids else []
         slice_indices = self.slice_indices[indices] if len(indices) > 0 else self.slice_indices.new_zeros((0,))
         return patient_ids, slice_indices
+
+    def _select_batch_paths(self, mask, domain="A"):
+        paths = self.batch_A_paths if domain == "A" else self.batch_B_paths
+        if not paths:
+            return []
+        if torch.is_tensor(mask):
+            mask_cpu = mask.detach().cpu().bool().view(-1)
+            indices = mask_cpu.nonzero(as_tuple=False).view(-1).tolist()
+        else:
+            indices = [idx for idx, flag in enumerate(mask) if bool(flag)]
+        return [paths[idx] for idx in indices]
 
     def _decode(self, latents, domain_value):
         domain = torch.full((latents.size(0), 1), float(domain_value), device=latents.device, dtype=latents.dtype)
@@ -749,15 +789,85 @@ class DualVelocityStructModel(BaseModel):
         denom = feat.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(float(self.opt.attn_norm_eps))
         return feat / denom
 
-    def _extract_attention_map(self, images):
+    def _dino_cache_file_path(self, image_path):
+        if self.dino_cache_dir is None:
+            return None
+        abs_path = os.path.abspath(str(image_path))
+        rel_path = os.path.relpath(abs_path, self.dino_cache_rel_root)
+        if rel_path.startswith(".."):
+            rel_path = os.path.basename(abs_path)
+        return os.path.join(self.dino_cache_dir, rel_path + ".pt")
+
+    def _load_cached_attention_item(self, image_path):
+        cache_path = self._dino_cache_file_path(image_path)
+        if cache_path is None or (not os.path.exists(cache_path)):
+            return None
+        data = torch.load(cache_path, map_location="cpu")
+        attn_map = data.get("attn_map", None)
+        cls_attn = data.get("cls_attn", None)
+        if attn_map is None or cls_attn is None:
+            return None
+        return attn_map, cls_attn
+
+    def _save_cached_attention_item(self, image_path, attn_map, cls_attn):
+        cache_path = self._dino_cache_file_path(image_path)
+        if cache_path is None:
+            return
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save(
+            {
+                "attn_map": attn_map.detach().cpu(),
+                "cls_attn": cls_attn.detach().cpu(),
+                "dino_model_name": self.opt.dino_model_name,
+                "dino_image_size": int(self.opt.dino_image_size),
+            },
+            cache_path,
+        )
+
+    def _extract_attention_map(self, images, image_paths=None):
+        if image_paths:
+            attn_map, _ = self._extract_attention_features(images, image_paths=image_paths)
+            return attn_map
         return self.dino_extractor(images)
 
-    def _extract_attention_features(self, images):
-        return self.dino_extractor(images, return_cls_attn=True)
+    def _extract_attention_features(self, images, image_paths=None):
+        if (not image_paths) or self.dino_cache_dir is None:
+            return self.dino_extractor(images, return_cls_attn=True)
 
-    def _predict_target_attention(self, images_A, net_phi=None, detach=False):
+        cache_hits = []
+        missing_indices = []
+        for idx, image_path in enumerate(image_paths):
+            cached = self._load_cached_attention_item(image_path)
+            if cached is None:
+                cache_hits.append(None)
+                missing_indices.append(idx)
+            else:
+                cache_hits.append(cached)
+
+        if len(missing_indices) == 0:
+            attn_map = torch.stack([item[0] for item in cache_hits], dim=0).to(self.device, non_blocking=True).float()
+            cls_attn = torch.stack([item[1] for item in cache_hits], dim=0).to(self.device, non_blocking=True).float()
+            if self.dino_cache_verbose:
+                print(f"[dino-cache] hit {len(image_paths)}/{len(image_paths)}")
+            return attn_map, cls_attn
+
+        if self.dino_cache_strict:
+            miss_files = [str(image_paths[idx]) for idx in missing_indices]
+            raise RuntimeError(f"DINO cache miss for {len(miss_files)} files (strict mode): {miss_files[:5]}")
+
+        attn_map_online, cls_attn_online = self.dino_extractor(images, return_cls_attn=True)
+        if self.dino_cache_verbose:
+            print(f"[dino-cache] hit {len(image_paths)-len(missing_indices)}/{len(image_paths)}, miss {len(missing_indices)}")
+
+        if self.dino_cache_save_missing:
+            for idx in missing_indices:
+                self._save_cached_attention_item(image_paths[idx], attn_map_online[idx], cls_attn_online[idx])
+
+        return attn_map_online, cls_attn_online
+
+    def _predict_target_attention(self, images_A, net_phi=None, detach=False, image_paths=None):
         net_phi = self.netPhi if net_phi is None else net_phi
-        attn_mri = self._extract_attention_map(images_A)
+        attn_mri = self._extract_attention_map(images_A, image_paths=image_paths)
         attn_ct_pred = net_phi(attn_mri)
         if detach:
             attn_ct_pred = attn_ct_pred.detach()
@@ -766,8 +876,8 @@ class DualVelocityStructModel(BaseModel):
     def _resize_attention_for_latent(self, attn_map, latents):
         return F.interpolate(attn_map, size=latents.shape[-2:], mode="bilinear", align_corners=False)
 
-    def _build_struct_condition(self, images_A, latents, net_phi=None, detach=True):
-        attn_target = self._predict_target_attention(images_A, net_phi=net_phi, detach=detach)
+    def _build_struct_condition(self, images_A, latents, net_phi=None, detach=True, image_paths=None):
+        attn_target = self._predict_target_attention(images_A, net_phi=net_phi, detach=detach, image_paths=image_paths)
         attn_target = self._normalize_struct_features(attn_target)
         return self._resize_attention_for_latent(attn_target, latents)
 
@@ -833,7 +943,7 @@ class DualVelocityStructModel(BaseModel):
         self.phi_epoch_kl_loss = kl_val if self.phi_epoch_kl_loss is None else (0.5 * self.phi_epoch_kl_loss + 0.5 * kl_val)
         self.phi_epoch_clip_loss = clip_val if self.phi_epoch_clip_loss is None else (0.5 * self.phi_epoch_clip_loss + 0.5 * clip_val)
 
-    def _phi_pretrain_step(self, images_A, images_B, patient_ids, slice_indices):
+    def _phi_pretrain_step(self, images_A, images_B, patient_ids, slice_indices, image_paths_A=None, image_paths_B=None):
         if not self.isTrain:
             return None
 
@@ -853,8 +963,8 @@ class DualVelocityStructModel(BaseModel):
         self.optimizer_Phi.zero_grad(set_to_none=True)
 
         with torch.no_grad():
-            attn_mri_map, _ = self._extract_attention_features(images_A)
-            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
+            attn_mri_map, _ = self._extract_attention_features(images_A, image_paths=image_paths_A)
+            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B, image_paths=image_paths_B)
         pred_ct = self.netPhi(attn_mri_map)
         total_loss, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
             pred_ct,
@@ -1040,17 +1150,19 @@ class DualVelocityStructModel(BaseModel):
             self._set_trainable(self.netVStruct, True)
 
         pair_patient_ids, pair_slice_indices = self._select_batch_metadata(self.is_paired)
+        pair_paths_A = self._select_batch_paths(self.is_paired, domain="A")
+        pair_paths_B = self._select_batch_paths(self.is_paired, domain="B")
         with torch.no_grad():
             latent_A, latent_B, _ = self._encode_latents(images_A, images_B, use_noise=False)
-            ref_attn = self._predict_target_attention(images_A, detach=True)
-            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
+            ref_attn = self._predict_target_attention(images_A, detach=True, image_paths=pair_paths_A)
+            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B, image_paths=pair_paths_B)
         loss_phi_pair, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
             ref_attn,
             attn_ct_map,
             attn_ct_cls,
             pair_patient_ids,
             pair_slice_indices,
-            )
+        )
 
         if self.optimizer_V_struct is not None:
             self.optimizer_V_struct.zero_grad()
@@ -1061,73 +1173,62 @@ class DualVelocityStructModel(BaseModel):
             use_structure=True,
             detach_vg=True,
         )
-                ref_attn = self._predict_target_attention(images_A, detach=True)
-                attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
-            total_loss, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
-                ref_attn,
-                attn_ct_map,
-                attn_ct_cls,
-                self._select_batch_metadata(self.is_paired)[0],
-                self._select_batch_metadata(self.is_paired)[1],
-            )
-            loss_phi_pair = total_loss
+        loss_pair = F.mse_loss(latents_fake, latent_B.detach())
+        loss_vs = self._vs_l2_penalty(v_s_hist)
+        loss_ortho = self._orthogonality_loss(v_g_hist, v_s_hist)
+        struct_condition = self._build_struct_condition(images_A, latent_A.detach(), detach=True, image_paths=pair_paths_A)
 
-            if self.optimizer_V_struct is not None:
-                self.optimizer_V_struct.zero_grad()
+        batch_size = latent_A.size(0)
+        t_rand = torch.rand(batch_size, device=latent_A.device, dtype=latent_A.dtype)
+        xt = torch.lerp(latent_A.detach(), latent_B.detach(), t_rand.view(-1, 1, 1, 1))
+        v0_label = self._compute_v0_label(xt, ref_attn)
+        if self.use_learned_struct:
+            cond_xt = self._resize_attention_for_latent(struct_condition, xt)
+            v_s_pred = self.netVStruct(torch.cat([xt, cond_xt], dim=1), t_rand)
+        else:
+            v_s_pred = self._estimate_v_s_perturb(xt, ref_attn)
+        loss_v0_match = F.mse_loss(v_s_pred, v0_label)
 
-            latents_fake, v_g_hist, v_s_hist = self.inference(
-                latent_A.detach(),
-                source_images=images_A,
-                use_structure=True,
-                detach_vg=True,
-            )
-            loss_pair = F.mse_loss(latents_fake, latent_B.detach())
-            loss_vs = self._vs_l2_penalty(v_s_hist)
-            loss_ortho = self._orthogonality_loss(v_g_hist, v_s_hist)
-            struct_condition = self._build_struct_condition(images_A, latent_A.detach(), detach=True)
+        loss_total = (
+            loss_phi_pair
+            + self.opt.lambda_pair * loss_pair
+            + self.opt.lambda_vs * loss_vs
+            + self.ortho_weight * loss_ortho
+            + self.opt.lambda_v0_match * loss_v0_match
+        )
 
-            batch_size = latent_A.size(0)
-            t_rand = torch.rand(batch_size, device=latent_A.device, dtype=latent_A.dtype)
-            xt = torch.lerp(latent_A.detach(), latent_B.detach(), t_rand.view(-1, 1, 1, 1))
-            v0_label = self._compute_v0_label(xt, ref_attn)
-            if self.use_learned_struct:
-                cond_xt = self._resize_attention_for_latent(struct_condition, xt)
-                v_s_pred = self.netVStruct(torch.cat([xt, cond_xt], dim=1), t_rand)
-            else:
-                v_s_pred = self._estimate_v_s_perturb(xt, ref_attn)
-            loss_v0_match = F.mse_loss(v_s_pred, v0_label)
+        loss_total.backward()
+        if self.optimizer_V_struct is not None:
+            self.optimizer_V_struct.step()
 
-            loss_total = (
-                total_loss
-                + self.opt.lambda_pair * loss_pair
-                + self.opt.lambda_vs * loss_vs
-                + self.ortho_weight * loss_ortho
-                + self.opt.lambda_v0_match * loss_v0_match
-            )
+        self.loss_G_phi_main = main_loss.detach()
+        self.loss_G_phi_mse = loss_mse.detach()
+        self.loss_G_phi_kl = loss_kl.detach()
+        self.loss_G_phi_clip = loss_clip.detach()
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
+        self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), pair_patient_ids, pair_slice_indices)
 
-            loss_total.backward()
-            if self.optimizer_V_struct is not None:
-                self.optimizer_V_struct.step()
+        return {
+            "loss_G_pair": loss_pair.detach(),
+            "loss_G_vs": loss_vs.detach(),
+            "loss_G_ortho": loss_ortho.detach(),
+            "loss_G_v0_match": loss_v0_match.detach(),
+            "loss_G_phi_pair": loss_phi_pair.detach(),
+        }
 
-            self.loss_G_phi_main = main_loss.detach()
-            self.loss_G_phi_mse = loss_mse.detach()
-            self.loss_G_phi_kl = loss_kl.detach()
-            self.loss_G_phi_clip = loss_clip.detach()
-            self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
-            self._update_phi_clip_queue(self._normalize_attention_distribution(attn_ct_cls, temperature=1.0), self._select_batch_metadata(self.is_paired)[0], self._select_batch_metadata(self.is_paired)[1])
+    def forward(self):
+        latent_A, latent_B, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
+        latents_fake, _, _ = self.inference(latent_A, source_images=self.real_A, use_structure=True, detach_vg=False)
+        self.fake_B = self._decode(latents_fake, domain_value=1.0)
+        self.rec_A = self._decode(latent_A, domain_value=0.0)
+        self.idt_B = self._decode(latent_B, domain_value=1.0)
+        if self.opt.log_attention_map:
+            self.attn_map = self._build_attention_map(self.real_A)
 
-            self.loss_G_phi_main = main_loss.detach()
-            self.loss_G_phi_mse = loss_mse.detach()
-            self.loss_G_phi_kl = loss_kl.detach()
-            self.loss_G_phi_clip = loss_clip.detach()
-
-            return {
-                "loss_G_pair": loss_pair.detach(),
-                "loss_G_vs": loss_vs.detach(),
-                "loss_G_ortho": loss_ortho.detach(),
-                "loss_G_v0_match": loss_v0_match.detach(),
-                "loss_G_phi_pair": loss_phi_pair.detach(),
-            }
+    def optimize_parameters(self):
+        self._init_loss_tensors()
+        self.is_phi_pretrain_stage = False
+        epoch = int(self.get_epoch())
         stage_epoch = max(0, epoch - int(getattr(self.opt, "epoch_count", 1)))
 
         phi_pretrain_epochs = int(getattr(self.opt, "phi_pretrain_epochs", 0))
@@ -1167,11 +1268,15 @@ class DualVelocityStructModel(BaseModel):
             phi_loss = None
             if self.is_paired.any():
                 pair_patient_ids, pair_slice_indices = self._select_batch_metadata(self.is_paired)
+                pair_paths_A = self._select_batch_paths(self.is_paired, domain="A")
+                pair_paths_B = self._select_batch_paths(self.is_paired, domain="B")
                 phi_loss = self._phi_pretrain_step(
                     self.real_A[self.is_paired],
                     self.real_B[self.is_paired],
                     pair_patient_ids,
                     pair_slice_indices,
+                    image_paths_A=pair_paths_A,
+                    image_paths_B=pair_paths_B,
                 )
                 if phi_loss is not None:
                     momentum = float(getattr(self.opt, "phi_pretrain_ema_momentum", 0.9))
@@ -1185,6 +1290,7 @@ class DualVelocityStructModel(BaseModel):
                     self._phi_epoch_loss_sq_sum += phi_loss_val * phi_loss_val
                     self._phi_epoch_loss_count += 1
                     self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
+                    self.phi_epoch_mse_loss = self.get_phi_epoch_mse_loss()
                     self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
             self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
             self.loss_G_total = self.loss_G_phi_pair
