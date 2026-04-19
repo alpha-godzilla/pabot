@@ -1,11 +1,16 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.dino_attention import DinoAttentionExtractor
 
@@ -22,7 +27,7 @@ class ImagePathDataset(Dataset):
         image_path = self.image_paths[index]
         image = Image.open(image_path).convert("RGB")
         tensor = self.to_tensor(image) * 2.0 - 1.0
-        return tensor, image_path
+        return tensor, str(image_path)
 
 
 def collect_images(dataroot, splits):
