@@ -215,6 +215,9 @@ class DualVelocityStructModel(BaseModel):
                             help="stop phi pretraining early when EMA phi loss <= threshold; negative disables")
         parser.add_argument("--phi_pretrain_ema_momentum", type=float, default=0.9,
                             help="EMA momentum used for phi loss early-stop tracking")
+        parser.add_argument("--phi_best_metric", type=str, default="main",
+                    choices=["main", "mse", "avg", "ema", "kl", "clip"],
+                    help="metric used to select best_phi checkpoint during phi pretraining")
         parser.add_argument("--auto_load_best_phi", type=util.str2bool, nargs="?", const=True, default=True,
                     help="when resuming, replace netPhi with checkpoint from epoch having minimum phi_pretrain_ema_loss")
         parser.add_argument("--dino_model_name", type=str, default="dino_vitb8",
@@ -442,6 +445,12 @@ class DualVelocityStructModel(BaseModel):
         if self._phi_epoch_loss_count <= 0:
             return None
         return self._phi_epoch_loss_sq_sum / float(self._phi_epoch_loss_count)
+
+    def get_phi_epoch_kl_loss(self):
+        return self.phi_epoch_kl_loss
+
+    def get_phi_epoch_clip_loss(self):
+        return self.phi_epoch_clip_loss
 
     @staticmethod
     def _to_python_str_list(value):
@@ -1176,7 +1185,7 @@ class DualVelocityStructModel(BaseModel):
                     self._phi_epoch_loss_sq_sum += phi_loss_val * phi_loss_val
                     self._phi_epoch_loss_count += 1
                     self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
-                        self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
+                    self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
             self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
             self.loss_G_total = self.loss_G_phi_pair
             self.fake_B = self.real_B.detach()

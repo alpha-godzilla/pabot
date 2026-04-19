@@ -10,8 +10,19 @@ from util.util import write_images
 from models.utils import eval_loader, eval_val_metrics, SimpleLogger
 
 
+def _normalize_phi_best_metric(metric):
+    return str(metric).strip().lower().replace('-', '_')
+
+
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
+    phi_best_metric = _normalize_phi_best_metric(getattr(opt, "phi_best_metric", "main"))
+    valid_phi_metrics = {"main", "mse", "avg", "ema", "kl", "clip"}
+    if phi_best_metric not in valid_phi_metrics:
+        raise ValueError(
+            f"Unsupported --phi_best_metric={phi_best_metric}. "
+            f"Choose from {sorted(valid_phi_metrics)}."
+        )
     wandb_run = None
     if getattr(opt, "use_wandb", False):
         try:
@@ -72,6 +83,8 @@ if __name__ == '__main__':
     best_phi_epoch = None
     best_phi_applied = False
 
+    print(f"[phi] best metric for checkpoint selection: {phi_best_metric}")
+
     def _scan_best_phi_loss_from_phase_states(run_dir):
         phase_pat = re.compile(r"^(\d+)_phase_state\.pth$")
         best_epoch_local = None
@@ -88,13 +101,28 @@ if __name__ == '__main__':
             except Exception:
                 continue
 
-            loss = state.get("phi_epoch_main_loss", None)
+            key_map = {
+                "main": "phi_epoch_main_loss",
+                "mse": "phi_epoch_mse_loss",
+                "avg": "phi_epoch_avg_loss",
+                "ema": "phi_pretrain_ema_loss",
+                "kl": "phi_epoch_kl_loss",
+                "clip": "phi_epoch_clip_loss",
+            }
+            loss = state.get(key_map[phi_best_metric], None)
+            # Backward-compatible fallback for older checkpoints.
             if loss is None:
-                loss = state.get("phi_epoch_mse_loss", None)
-            if loss is None:
-                loss = state.get("phi_epoch_avg_loss", None)
-            if loss is None:
-                loss = state.get("phi_pretrain_ema_loss", None)
+                for fallback_key in (
+                    "phi_epoch_main_loss",
+                    "phi_epoch_mse_loss",
+                    "phi_epoch_avg_loss",
+                    "phi_pretrain_ema_loss",
+                    "phi_epoch_kl_loss",
+                    "phi_epoch_clip_loss",
+                ):
+                    loss = state.get(fallback_key, None)
+                    if loss is not None:
+                        break
             if loss is None:
                 continue
             try:
@@ -209,13 +237,25 @@ if __name__ == '__main__':
         max_phi_epochs = max(0, max_phi_epochs)
         in_phi_stage = stage_epoch < max_phi_epochs
 
-        phi_epoch_loss = model.get_phi_epoch_main_loss() if hasattr(model, "get_phi_epoch_main_loss") else None
+        phi_getter_name = {
+            "main": "get_phi_epoch_main_loss",
+            "mse": "get_phi_epoch_mse_loss",
+            "avg": "get_phi_epoch_avg_loss",
+            "ema": None,
+            "kl": "get_phi_epoch_kl_loss",
+            "clip": "get_phi_epoch_clip_loss",
+        }[phi_best_metric]
+        if phi_best_metric == "ema":
+            phi_epoch_loss = getattr(model, "phi_pretrain_ema_loss", None)
+        else:
+            phi_getter = getattr(model, phi_getter_name, None)
+            phi_epoch_loss = phi_getter() if callable(phi_getter) else None
         if in_phi_stage and phi_epoch_loss is not None:
             if best_phi_loss is None or float(phi_epoch_loss) < float(best_phi_loss):
                 best_phi_loss = float(phi_epoch_loss)
                 best_phi_epoch = int(epoch)
                 model.save_networks('best_phi')
-                print('==> Best Phi loss: %.6f at epoch %d, saving best_phi model' % (best_phi_loss, best_phi_epoch))
+                print('==> Best Phi %s: %.6f at epoch %d, saving best_phi model' % (phi_best_metric, best_phi_loss, best_phi_epoch))
 
         # Right after finishing phi-pretrain (e.g., phi50), swap to best_phi for warmup/normal stages.
         if (not in_phi_stage) and (not best_phi_applied) and best_phi_epoch is not None and max_phi_epochs > 0:
