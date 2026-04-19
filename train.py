@@ -68,16 +68,16 @@ if __name__ == '__main__':
         print('Warning: lpips not installed, LPIPS will be skipped. Install with: pip install lpips')
         lpips_fn = None
     best_psnr = 0.0
-    best_phi_mse = None
+    best_phi_loss = None
     best_phi_epoch = None
     best_phi_applied = False
 
-    def _scan_best_phi_mse_from_phase_states(run_dir):
+    def _scan_best_phi_loss_from_phase_states(run_dir):
         phase_pat = re.compile(r"^(\d+)_phase_state\.pth$")
         best_epoch_local = None
-        best_mse_local = None
+        best_loss_local = None
         if not os.path.isdir(run_dir):
-            return best_epoch_local, best_mse_local
+            return best_epoch_local, best_loss_local
         for fname in os.listdir(run_dir):
             m = phase_pat.match(fname)
             if m is None:
@@ -87,23 +87,30 @@ if __name__ == '__main__':
                 state = torch.load(path, map_location="cpu")
             except Exception:
                 continue
-            mse = state.get("phi_epoch_mse_loss", None)
-            if mse is None:
+
+            loss = state.get("phi_epoch_main_loss", None)
+            if loss is None:
+                loss = state.get("phi_epoch_mse_loss", None)
+            if loss is None:
+                loss = state.get("phi_epoch_avg_loss", None)
+            if loss is None:
+                loss = state.get("phi_pretrain_ema_loss", None)
+            if loss is None:
                 continue
             try:
-                mse = float(mse)
+                loss = float(loss)
             except (TypeError, ValueError):
                 continue
             ep = int(m.group(1))
-            if best_mse_local is None or mse < best_mse_local:
-                best_mse_local = mse
+            if best_loss_local is None or loss < best_loss_local:
+                best_loss_local = loss
                 best_epoch_local = ep
-        return best_epoch_local, best_mse_local
+        return best_epoch_local, best_loss_local
 
     if bool(getattr(opt, "continue_train", False)):
-        best_phi_epoch, best_phi_mse = _scan_best_phi_mse_from_phase_states(opt.run_dir)
-        if best_phi_mse is not None:
-            print(f"[resume] current best phi-epoch-mse from history: epoch={best_phi_epoch}, mse={best_phi_mse:.6f}")
+        best_phi_epoch, best_phi_loss = _scan_best_phi_loss_from_phase_states(opt.run_dir)
+        if best_phi_loss is not None:
+            print(f"[resume] current best phi-loss from history: epoch={best_phi_epoch}, loss={best_phi_loss:.6f}")
 
     optimize_time = 0.1
 
@@ -191,7 +198,7 @@ if __name__ == '__main__':
             print('saving epoch checkpoint at epoch %d, iters %d' % (epoch, total_iters))
             model.save_networks(epoch)
 
-        # Track best phi by minimum epoch-MSE of phi loss during phi pretraining stage.
+        # Track best phi by minimum selected phi loss during phi pretraining stage.
         stage_epoch = max(0, int(epoch) - int(getattr(opt, "epoch_count", 1)))
         phi_pretrain_epochs = int(getattr(opt, "phi_pretrain_epochs", 0))
         phi_pretrain_max_epochs = getattr(opt, "phi_pretrain_max_epochs", None)
@@ -202,13 +209,13 @@ if __name__ == '__main__':
         max_phi_epochs = max(0, max_phi_epochs)
         in_phi_stage = stage_epoch < max_phi_epochs
 
-        phi_epoch_mse = model.get_phi_epoch_mse_loss() if hasattr(model, "get_phi_epoch_mse_loss") else None
-        if in_phi_stage and phi_epoch_mse is not None:
-            if best_phi_mse is None or float(phi_epoch_mse) < float(best_phi_mse):
-                best_phi_mse = float(phi_epoch_mse)
+        phi_epoch_loss = model.get_phi_epoch_main_loss() if hasattr(model, "get_phi_epoch_main_loss") else None
+        if in_phi_stage and phi_epoch_loss is not None:
+            if best_phi_loss is None or float(phi_epoch_loss) < float(best_phi_loss):
+                best_phi_loss = float(phi_epoch_loss)
                 best_phi_epoch = int(epoch)
                 model.save_networks('best_phi')
-                print('==> Best Phi MSE: %.6f at epoch %d, saving best_phi model' % (best_phi_mse, best_phi_epoch))
+                print('==> Best Phi loss: %.6f at epoch %d, saving best_phi model' % (best_phi_loss, best_phi_epoch))
 
         # Right after finishing phi-pretrain (e.g., phi50), swap to best_phi for warmup/normal stages.
         if (not in_phi_stage) and (not best_phi_applied) and best_phi_epoch is not None and max_phi_epochs > 0:

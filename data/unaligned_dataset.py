@@ -3,7 +3,20 @@ from data.base_dataset import BaseDataset, get_transform
 from data.image_folder import make_dataset
 from PIL import Image
 import random
+import os
+import re
 import util.util as util
+
+
+_SLICE_RE = re.compile(r"^(?P<patient>.+?)_slice(?P<slice>\d+)$", re.IGNORECASE)
+
+
+def _parse_patient_and_slice(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    match = _SLICE_RE.match(stem)
+    if match is None:
+        return stem, -1
+    return match.group("patient"), int(match.group("slice"))
 
 
 class UnalignedDataset(BaseDataset):
@@ -102,6 +115,7 @@ class UnalignedDataset(BaseDataset):
         B_path = self.B_paths[index_B]
         A_img = Image.open(A_path).convert('RGB')
         B_img = Image.open(B_path).convert('RGB')
+        patient_id, slice_idx = _parse_patient_and_slice(A_path)
         
 
         # Apply image transformation
@@ -113,7 +127,15 @@ class UnalignedDataset(BaseDataset):
         A = transform(A_img)
         B = transform(B_img)
 
-        return {'A': A, 'B': B, 'A_paths': A_path, 'B_paths': B_path, 'is_paired': is_paired}
+        return {
+            'A': A,
+            'B': B,
+            'A_paths': A_path,
+            'B_paths': B_path,
+            'is_paired': is_paired,
+            'patient_id': patient_id,
+            'slice_idx': slice_idx,
+        }
 
     def __len__(self):
         """Return the total number of images in the dataset.

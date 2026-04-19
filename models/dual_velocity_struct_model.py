@@ -191,6 +191,18 @@ class DualVelocityStructModel(BaseModel):
                             help="weight for paired structure feature consistency loss")
         parser.add_argument("--lambda_phi_attn", type=float, default=1.0,
                             help="weight for phi(attn_mri) -> attn_ct supervision during phi pretraining")
+        parser.add_argument("--phi_loss_mode", type=str, default="kl_clip", choices=["kl", "clip", "kl_clip"],
+                    help="Phi supervision mode: KL only, CLIP only, or KL+CLIP")
+        parser.add_argument("--phi_aux_mse_weight", type=float, default=0.0,
+                    help="optional auxiliary MSE weight on normalized Phi attention map")
+        parser.add_argument("--phi_kl_temperature", type=float, default=1.0,
+                    help="temperature used to smooth Phi/CT attention distributions before KL")
+        parser.add_argument("--phi_clip_temperature", type=float, default=0.07,
+                    help="temperature for the weighted CLIP-style contrastive loss")
+        parser.add_argument("--phi_clip_distance_sigma", type=float, default=4.0,
+                    help="distance decay scale for same-patient positive weights in CLIP loss")
+        parser.add_argument("--phi_clip_queue_size", type=int, default=512,
+                    help="number of CT attention embeddings cached for CLIP loss")
         parser.add_argument("--v0_stopgrad_phi", type=util.str2bool, nargs="?", const=True, default=True,
                             help="stop gradients to net_A when computing distilled V0 labels")
         parser.add_argument("--phi_hidden_channels", type=int, default=32,
@@ -241,6 +253,10 @@ class DualVelocityStructModel(BaseModel):
             "G_ortho",
             "G_pair",
             "G_v0_match",
+            "G_phi_main",
+            "G_phi_mse",
+            "G_phi_kl",
+            "G_phi_clip",
             "G_phi_pair",
             "G_total",
         ]
@@ -352,10 +368,18 @@ class DualVelocityStructModel(BaseModel):
         self.phi_pretrain_end_stage_epoch = None
         self.phi_pretrain_ema_loss = None
         self.phi_epoch_avg_loss = None
+        self.phi_epoch_main_loss = None
         self.phi_epoch_mse_loss = None
+        self.phi_epoch_kl_loss = None
+        self.phi_epoch_clip_loss = None
         self._phi_epoch_loss_sum = 0.0
         self._phi_epoch_loss_sq_sum = 0.0
         self._phi_epoch_loss_count = 0
+        self._phi_epoch_main_loss_sum = 0.0
+        self._phi_epoch_main_loss_sq_sum = 0.0
+        self._phi_epoch_main_loss_count = 0
+        self._phi_clip_queue = []
+        self._phi_clip_queue_size = max(0, int(getattr(self.opt, "phi_clip_queue_size", 0)))
         self.is_phi_pretrain_stage = False
 
     def _phase_state_path(self, epoch):
@@ -367,7 +391,10 @@ class DualVelocityStructModel(BaseModel):
             "phi_pretrain_end_stage_epoch": self.phi_pretrain_end_stage_epoch,
             "phi_pretrain_ema_loss": self.phi_pretrain_ema_loss,
             "phi_epoch_avg_loss": self.phi_epoch_avg_loss,
+            "phi_epoch_main_loss": self.phi_epoch_main_loss,
             "phi_epoch_mse_loss": self.phi_epoch_mse_loss,
+            "phi_epoch_kl_loss": self.phi_epoch_kl_loss,
+            "phi_epoch_clip_loss": self.phi_epoch_clip_loss,
         }
         torch.save(phase_state, self._phase_state_path(epoch))
 
@@ -379,7 +406,10 @@ class DualVelocityStructModel(BaseModel):
             self.phi_pretrain_end_stage_epoch = phase_state.get("phi_pretrain_end_stage_epoch", None)
             self.phi_pretrain_ema_loss = phase_state.get("phi_pretrain_ema_loss", None)
             self.phi_epoch_avg_loss = phase_state.get("phi_epoch_avg_loss", None)
+            self.phi_epoch_main_loss = phase_state.get("phi_epoch_main_loss", None)
             self.phi_epoch_mse_loss = phase_state.get("phi_epoch_mse_loss", None)
+            self.phi_epoch_kl_loss = phase_state.get("phi_epoch_kl_loss", None)
+            self.phi_epoch_clip_loss = phase_state.get("phi_epoch_clip_loss", None)
 
         if self.isTrain and bool(getattr(self.opt, "continue_train", False)) and bool(getattr(self.opt, "auto_load_best_phi", False)):
             self._maybe_load_best_phi_by_phase_loss()
@@ -389,18 +419,166 @@ class DualVelocityStructModel(BaseModel):
         self._phi_epoch_loss_sum = 0.0
         self._phi_epoch_loss_sq_sum = 0.0
         self._phi_epoch_loss_count = 0
+        self._phi_epoch_main_loss_sum = 0.0
+        self._phi_epoch_main_loss_sq_sum = 0.0
+        self._phi_epoch_main_loss_count = 0
         self.phi_epoch_avg_loss = None
+        self.phi_epoch_main_loss = None
         self.phi_epoch_mse_loss = None
+        self.phi_epoch_kl_loss = None
+        self.phi_epoch_clip_loss = None
 
     def get_phi_epoch_avg_loss(self):
         if self._phi_epoch_loss_count <= 0:
             return None
         return self._phi_epoch_loss_sum / float(self._phi_epoch_loss_count)
 
+    def get_phi_epoch_main_loss(self):
+        if self._phi_epoch_main_loss_count <= 0:
+            return None
+        return self._phi_epoch_main_loss_sum / float(self._phi_epoch_main_loss_count)
+
     def get_phi_epoch_mse_loss(self):
         if self._phi_epoch_loss_count <= 0:
             return None
         return self._phi_epoch_loss_sq_sum / float(self._phi_epoch_loss_count)
+
+    @staticmethod
+    def _to_python_str_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return [str(item) for item in value]
+
+    @staticmethod
+    def _to_long_tensor(value, device):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value.to(device).long().view(-1)
+        if isinstance(value, (list, tuple)):
+            return torch.tensor(list(value), device=device, dtype=torch.long).view(-1)
+        return torch.tensor([int(value)], device=device, dtype=torch.long)
+
+    @staticmethod
+    def _normalize_attention_distribution(logits, temperature=1.0, eps=1e-8):
+        scaled = logits / max(float(temperature), eps)
+        return torch.softmax(scaled, dim=-1)
+
+    @staticmethod
+    def _sum_normalize_attention(prob, eps=1e-8):
+        prob = prob.clamp_min(eps)
+        return prob / prob.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    def _extract_attention_features(self, images):
+        attn_map, cls_attn = self.dino_extractor(images, return_cls_attn=True)
+        return attn_map, cls_attn
+
+    def _phi_attention_logits(self, attn_map):
+        return attn_map.flatten(1)
+
+    def _phi_attention_prob(self, attn_map, temperature=1.0):
+        return self._normalize_attention_distribution(self._phi_attention_logits(attn_map), temperature=temperature)
+
+    def _update_phi_clip_queue(self, attn_probs, patient_ids, slice_indices):
+        if self._phi_clip_queue_size <= 0:
+            return
+        patient_list = self._to_python_str_list(patient_ids)
+        slice_tensor = self._to_long_tensor(slice_indices, device=attn_probs.device)
+        if slice_tensor is None:
+            return
+        probs_cpu = attn_probs.detach().cpu()
+        slice_cpu = slice_tensor.detach().cpu()
+        for idx in range(probs_cpu.shape[0]):
+            self._phi_clip_queue.append((probs_cpu[idx].clone(), patient_list[idx], int(slice_cpu[idx].item())))
+        if len(self._phi_clip_queue) > self._phi_clip_queue_size:
+            self._phi_clip_queue = self._phi_clip_queue[-self._phi_clip_queue_size:]
+
+    def _build_phi_clip_candidate_bank(self, current_ct_probs, patient_ids, slice_indices):
+        patient_list = self._to_python_str_list(patient_ids)
+        slice_tensor = self._to_long_tensor(slice_indices, device=current_ct_probs.device)
+        if slice_tensor is None:
+            raise RuntimeError("slice_indices are required for CLIP-style Phi loss.")
+
+        candidate_probs = [current_ct_probs]
+        candidate_patient_ids = list(patient_list)
+        candidate_slice_indices = [int(item) for item in slice_tensor.detach().cpu().tolist()]
+
+        for probs_cpu, patient_id, slice_idx in self._phi_clip_queue:
+            candidate_probs.append(probs_cpu.to(current_ct_probs.device).unsqueeze(0))
+            candidate_patient_ids.append(str(patient_id))
+            candidate_slice_indices.append(int(slice_idx))
+
+        candidate_probs = torch.cat(candidate_probs, dim=0)
+        candidate_patient_ids = list(candidate_patient_ids)
+        candidate_slice_indices = torch.tensor(candidate_slice_indices, device=current_ct_probs.device, dtype=torch.long)
+        return candidate_probs, candidate_patient_ids, candidate_slice_indices
+
+    def _compute_phi_kl_loss(self, pred_map, target_cls, temperature=None):
+        temp = float(self.opt.phi_kl_temperature if temperature is None else temperature)
+        pred_prob = self._normalize_attention_distribution(self._phi_attention_logits(pred_map), temperature=temp)
+        target_prob = self._sum_normalize_attention(target_cls)
+        return F.kl_div(torch.log(pred_prob.clamp_min(1e-8)), target_prob, reduction="batchmean")
+
+    def _compute_phi_clip_loss(self, pred_map, target_cls, patient_ids, slice_indices):
+        temp = float(self.opt.phi_clip_temperature)
+        sigma = max(float(self.opt.phi_clip_distance_sigma), 1e-6)
+        anchor_prob = self._phi_attention_prob(pred_map, temperature=1.0)
+        candidate_probs, candidate_patient_ids, candidate_slice_indices = self._build_phi_clip_candidate_bank(
+            self._sum_normalize_attention(target_cls),
+            patient_ids,
+            slice_indices,
+        )
+
+        anchor_patient_ids = self._to_python_str_list(patient_ids)
+        anchor_slice_indices = self._to_long_tensor(slice_indices, device=pred_map.device)
+        if anchor_slice_indices is None:
+            raise RuntimeError("slice_indices are required for CLIP-style Phi loss.")
+
+        anchor_emb = F.normalize(anchor_prob, dim=-1)
+        candidate_emb = F.normalize(candidate_probs, dim=-1)
+        logits = anchor_emb @ candidate_emb.t()
+        logits = logits / max(temp, 1e-6)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        candidate_patient_tensor = candidate_patient_ids
+        candidate_slice_tensor = candidate_slice_indices
+        losses = []
+        for row_idx, (patient_id, slice_idx) in enumerate(zip(anchor_patient_ids, anchor_slice_indices.detach().cpu().tolist())):
+            positive_mask = torch.tensor(
+                [cand_patient == patient_id for cand_patient in candidate_patient_tensor],
+                device=pred_map.device,
+                dtype=torch.float32,
+            )
+            if positive_mask.sum() <= 0:
+                continue
+            distance = (candidate_slice_tensor - int(slice_idx)).abs().float()
+            positive_weights = torch.exp(-distance / sigma) * positive_mask
+            positive_weights = positive_weights / positive_weights.sum().clamp_min(1e-8)
+            losses.append(-(positive_weights * log_probs[row_idx]).sum())
+
+        if not losses:
+            return torch.tensor(0.0, device=pred_map.device)
+        return torch.stack(losses).mean()
+
+    def _compute_phi_supervision_losses(self, pred_map, target_map, target_cls, patient_ids, slice_indices):
+        loss_mse = F.mse_loss(self._normalize_struct_features(pred_map), self._normalize_struct_features(target_map))
+        loss_kl = self._compute_phi_kl_loss(pred_map, target_cls)
+        loss_clip = self._compute_phi_clip_loss(pred_map, target_cls, patient_ids, slice_indices)
+
+        mode = str(getattr(self.opt, "phi_loss_mode", "kl_clip"))
+        if mode == "kl":
+            main_loss = loss_kl
+        elif mode == "clip":
+            main_loss = loss_clip
+        elif mode == "kl_clip":
+            main_loss = loss_kl + loss_clip
+        else:
+            raise ValueError(f"Unsupported phi_loss_mode: {mode}")
+
+        total_loss = main_loss + float(getattr(self.opt, "phi_aux_mse_weight", 0.0)) * loss_mse
+        return total_loss, main_loss, loss_mse, loss_kl, loss_clip
 
     def _maybe_load_best_phi_by_phase_loss(self):
         if self.opt.isTrain and self.opt.pretrained_name is not None:
@@ -427,8 +605,11 @@ class DualVelocityStructModel(BaseModel):
             except Exception:
                 continue
 
-            loss = state.get("phi_epoch_mse_loss", None)
-            loss_name = "mse_loss"
+            loss = state.get("phi_epoch_main_loss", None)
+            loss_name = "main_loss"
+            if loss is None:
+                loss = state.get("phi_epoch_mse_loss", None)
+                loss_name = "mse_loss"
             if loss is None:
                 loss = state.get("phi_epoch_avg_loss", None)
                 loss_name = "avg_loss"
@@ -476,6 +657,10 @@ class DualVelocityStructModel(BaseModel):
         self.loss_G_ortho = zero
         self.loss_G_pair = zero
         self.loss_G_v0_match = zero
+        self.loss_G_phi_main = zero
+        self.loss_G_phi_mse = zero
+        self.loss_G_phi_kl = zero
+        self.loss_G_phi_clip = zero
         self.loss_G_phi_pair = zero
         self.loss_G_total = zero
 
@@ -490,6 +675,8 @@ class DualVelocityStructModel(BaseModel):
         self.real_A = input["A" if AtoB else "B"].to(self.device)
         self.real_B = input["B" if AtoB else "A"].to(self.device)
         self.image_paths = input["A_paths" if AtoB else "B_paths"]
+        self.patient_ids = self._to_python_str_list(input.get("patient_id", None))
+        self.slice_indices = self._to_long_tensor(input.get("slice_idx", None), device=self.device)
         is_paired = input.get("is_paired", None)
         if is_paired is None:
             self.is_paired = torch.zeros(self.real_A.size(0), device=self.device, dtype=torch.bool)
@@ -497,6 +684,18 @@ class DualVelocityStructModel(BaseModel):
             self.is_paired = torch.full((self.real_A.size(0),), is_paired, device=self.device, dtype=torch.bool)
         else:
             self.is_paired = is_paired.to(self.device).bool().view(-1)
+
+    def _select_batch_metadata(self, mask):
+        if self.slice_indices is None:
+            return [], None
+        if torch.is_tensor(mask):
+            mask_cpu = mask.detach().cpu().bool().view(-1)
+            indices = mask_cpu.nonzero(as_tuple=False).view(-1).tolist()
+        else:
+            indices = [idx for idx, flag in enumerate(mask) if bool(flag)]
+        patient_ids = [self.patient_ids[idx] for idx in indices] if self.patient_ids else []
+        slice_indices = self.slice_indices[indices] if len(indices) > 0 else self.slice_indices.new_zeros((0,))
+        return patient_ids, slice_indices
 
     def _decode(self, latents, domain_value):
         domain = torch.full((latents.size(0), 1), float(domain_value), device=latents.device, dtype=latents.dtype)
@@ -543,6 +742,9 @@ class DualVelocityStructModel(BaseModel):
 
     def _extract_attention_map(self, images):
         return self.dino_extractor(images)
+
+    def _extract_attention_features(self, images):
+        return self.dino_extractor(images, return_cls_attn=True)
 
     def _predict_target_attention(self, images_A, net_phi=None, detach=False):
         net_phi = self.netPhi if net_phi is None else net_phi
@@ -602,7 +804,27 @@ class DualVelocityStructModel(BaseModel):
                 param.requires_grad = flag
         return v0.detach()
 
-    def _phi_pretrain_step(self, images_A, images_B):
+    def _record_phi_epoch_metrics(self, main_loss, mse_loss, kl_loss, clip_loss):
+        main_val = float(main_loss.item())
+        mse_val = float(mse_loss.item())
+        kl_val = float(kl_loss.item())
+        clip_val = float(clip_loss.item())
+
+        self._phi_epoch_main_loss_sum += main_val
+        self._phi_epoch_main_loss_sq_sum += main_val * main_val
+        self._phi_epoch_main_loss_count += 1
+        self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
+
+        self._phi_epoch_loss_sum += main_val
+        self._phi_epoch_loss_sq_sum += main_val * main_val
+        self._phi_epoch_loss_count += 1
+        self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
+
+        self.phi_epoch_mse_loss = mse_val if self.phi_epoch_mse_loss is None else (0.5 * self.phi_epoch_mse_loss + 0.5 * mse_val)
+        self.phi_epoch_kl_loss = kl_val if self.phi_epoch_kl_loss is None else (0.5 * self.phi_epoch_kl_loss + 0.5 * kl_val)
+        self.phi_epoch_clip_loss = clip_val if self.phi_epoch_clip_loss is None else (0.5 * self.phi_epoch_clip_loss + 0.5 * clip_val)
+
+    def _phi_pretrain_step(self, images_A, images_B, patient_ids, slice_indices):
         if not self.isTrain:
             return None
 
@@ -622,16 +844,26 @@ class DualVelocityStructModel(BaseModel):
         self.optimizer_Phi.zero_grad(set_to_none=True)
 
         with torch.no_grad():
-            attn_mri = self._extract_attention_map(images_A)
-            attn_ct = self._extract_attention_map(images_B)
-        pred_ct = self.netPhi(attn_mri)
-        loss_phi = F.mse_loss(
-            self._normalize_struct_features(pred_ct),
-            self._normalize_struct_features(attn_ct),
+            attn_mri_map, _ = self._extract_attention_features(images_A)
+            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
+        pred_ct = self.netPhi(attn_mri_map)
+        total_loss, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
+            pred_ct,
+            attn_ct_map,
+            attn_ct_cls,
+            patient_ids,
+            slice_indices,
         )
-        (self.opt.lambda_phi_attn * loss_phi).backward()
+        (self.opt.lambda_phi_attn * total_loss).backward()
         self.optimizer_Phi.step()
-        return loss_phi.detach()
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
+        self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), patient_ids, slice_indices)
+
+        self.loss_G_phi_main = main_loss.detach()
+        self.loss_G_phi_mse = loss_mse.detach()
+        self.loss_G_phi_kl = loss_kl.detach()
+        self.loss_G_phi_clip = loss_clip.detach()
+        return total_loss.detach()
 
     def inference(self, latents_A, source_images=None, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
         latents = latents_A
@@ -798,12 +1030,17 @@ class DualVelocityStructModel(BaseModel):
         if self.netVStruct is not None:
             self._set_trainable(self.netVStruct, True)
 
+        pair_patient_ids, pair_slice_indices = self._select_batch_metadata(self.is_paired)
         with torch.no_grad():
             latent_A, latent_B, _ = self._encode_latents(images_A, images_B, use_noise=False)
             ref_attn = self._predict_target_attention(images_A, detach=True)
-            loss_phi_pair = F.mse_loss(
-                self._normalize_struct_features(ref_attn),
-                self._normalize_struct_features(self._extract_attention_map(images_B)),
+            attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
+        loss_phi_pair, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
+            ref_attn,
+            attn_ct_map,
+            attn_ct_cls,
+            pair_patient_ids,
+            pair_slice_indices,
             )
 
         if self.optimizer_V_struct is not None:
@@ -815,54 +1052,73 @@ class DualVelocityStructModel(BaseModel):
             use_structure=True,
             detach_vg=True,
         )
-        loss_pair = F.mse_loss(latents_fake, latent_B.detach())
-        loss_vs = self._vs_l2_penalty(v_s_hist)
-        loss_ortho = self._orthogonality_loss(v_g_hist, v_s_hist)
-        struct_condition = self._build_struct_condition(images_A, latent_A.detach(), detach=True)
+                ref_attn = self._predict_target_attention(images_A, detach=True)
+                attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B)
+            total_loss, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
+                ref_attn,
+                attn_ct_map,
+                attn_ct_cls,
+                self._select_batch_metadata(self.is_paired)[0],
+                self._select_batch_metadata(self.is_paired)[1],
+            )
+            loss_phi_pair = total_loss
 
-        batch_size = latent_A.size(0)
-        t_rand = torch.rand(batch_size, device=latent_A.device, dtype=latent_A.dtype)
-        xt = torch.lerp(latent_A.detach(), latent_B.detach(), t_rand.view(-1, 1, 1, 1))
-        v0_label = self._compute_v0_label(xt, ref_attn)
-        if self.use_learned_struct:
-            cond_xt = self._resize_attention_for_latent(struct_condition, xt)
-            v_s_pred = self.netVStruct(torch.cat([xt, cond_xt], dim=1), t_rand)
-        else:
-            v_s_pred = self._estimate_v_s_perturb(xt, ref_attn)
-        loss_v0_match = F.mse_loss(v_s_pred, v0_label)
+            if self.optimizer_V_struct is not None:
+                self.optimizer_V_struct.zero_grad()
 
-        loss_total = (
-            self.opt.lambda_pair * loss_pair
-            + self.opt.lambda_vs * loss_vs
-            + self.ortho_weight * loss_ortho
-            + self.opt.lambda_v0_match * loss_v0_match
-        )
+            latents_fake, v_g_hist, v_s_hist = self.inference(
+                latent_A.detach(),
+                source_images=images_A,
+                use_structure=True,
+                detach_vg=True,
+            )
+            loss_pair = F.mse_loss(latents_fake, latent_B.detach())
+            loss_vs = self._vs_l2_penalty(v_s_hist)
+            loss_ortho = self._orthogonality_loss(v_g_hist, v_s_hist)
+            struct_condition = self._build_struct_condition(images_A, latent_A.detach(), detach=True)
 
-        loss_total.backward()
-        if self.optimizer_V_struct is not None:
-            self.optimizer_V_struct.step()
+            batch_size = latent_A.size(0)
+            t_rand = torch.rand(batch_size, device=latent_A.device, dtype=latent_A.dtype)
+            xt = torch.lerp(latent_A.detach(), latent_B.detach(), t_rand.view(-1, 1, 1, 1))
+            v0_label = self._compute_v0_label(xt, ref_attn)
+            if self.use_learned_struct:
+                cond_xt = self._resize_attention_for_latent(struct_condition, xt)
+                v_s_pred = self.netVStruct(torch.cat([xt, cond_xt], dim=1), t_rand)
+            else:
+                v_s_pred = self._estimate_v_s_perturb(xt, ref_attn)
+            loss_v0_match = F.mse_loss(v_s_pred, v0_label)
 
-        return {
-            "loss_G_pair": loss_pair.detach(),
-            "loss_G_vs": loss_vs.detach(),
-            "loss_G_ortho": loss_ortho.detach(),
-            "loss_G_v0_match": loss_v0_match.detach(),
-            "loss_G_phi_pair": loss_phi_pair.detach(),
-        }
+            loss_total = (
+                total_loss
+                + self.opt.lambda_pair * loss_pair
+                + self.opt.lambda_vs * loss_vs
+                + self.ortho_weight * loss_ortho
+                + self.opt.lambda_v0_match * loss_v0_match
+            )
 
-    def forward(self):
-        latent_A, latent_B, _ = self._encode_latents(self.real_A, self.real_B, use_noise=False)
-        latents_fake, _, _ = self.inference(latent_A, source_images=self.real_A, use_structure=True, detach_vg=False)
-        self.fake_B = self._decode(latents_fake, domain_value=1.0)
-        self.rec_A = self._decode(latent_A, domain_value=0.0)
-        self.idt_B = self._decode(latent_B, domain_value=1.0)
-        if self.opt.log_attention_map:
-            self.attn_map = self._build_attention_map(self.real_A)
+            loss_total.backward()
+            if self.optimizer_V_struct is not None:
+                self.optimizer_V_struct.step()
 
-    def optimize_parameters(self):
-        self._init_loss_tensors()
-        self.is_phi_pretrain_stage = False
-        epoch = int(self.get_epoch())
+            self.loss_G_phi_main = main_loss.detach()
+            self.loss_G_phi_mse = loss_mse.detach()
+            self.loss_G_phi_kl = loss_kl.detach()
+            self.loss_G_phi_clip = loss_clip.detach()
+            self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
+            self._update_phi_clip_queue(self._normalize_attention_distribution(attn_ct_cls, temperature=1.0), self._select_batch_metadata(self.is_paired)[0], self._select_batch_metadata(self.is_paired)[1])
+
+            self.loss_G_phi_main = main_loss.detach()
+            self.loss_G_phi_mse = loss_mse.detach()
+            self.loss_G_phi_kl = loss_kl.detach()
+            self.loss_G_phi_clip = loss_clip.detach()
+
+            return {
+                "loss_G_pair": loss_pair.detach(),
+                "loss_G_vs": loss_vs.detach(),
+                "loss_G_ortho": loss_ortho.detach(),
+                "loss_G_v0_match": loss_v0_match.detach(),
+                "loss_G_phi_pair": loss_phi_pair.detach(),
+            }
         stage_epoch = max(0, epoch - int(getattr(self.opt, "epoch_count", 1)))
 
         phi_pretrain_epochs = int(getattr(self.opt, "phi_pretrain_epochs", 0))
@@ -901,7 +1157,13 @@ class DualVelocityStructModel(BaseModel):
         if is_phi_pretrain:
             phi_loss = None
             if self.is_paired.any():
-                phi_loss = self._phi_pretrain_step(self.real_A[self.is_paired], self.real_B[self.is_paired])
+                pair_patient_ids, pair_slice_indices = self._select_batch_metadata(self.is_paired)
+                phi_loss = self._phi_pretrain_step(
+                    self.real_A[self.is_paired],
+                    self.real_B[self.is_paired],
+                    pair_patient_ids,
+                    pair_slice_indices,
+                )
                 if phi_loss is not None:
                     momentum = float(getattr(self.opt, "phi_pretrain_ema_momentum", 0.9))
                     momentum = min(max(momentum, 0.0), 0.9999)
@@ -914,7 +1176,7 @@ class DualVelocityStructModel(BaseModel):
                     self._phi_epoch_loss_sq_sum += phi_loss_val * phi_loss_val
                     self._phi_epoch_loss_count += 1
                     self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
-                    self.phi_epoch_mse_loss = self.get_phi_epoch_mse_loss()
+                        self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
             self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
             self.loss_G_total = self.loss_G_phi_pair
             self.fake_B = self.real_B.detach()

@@ -52,7 +52,7 @@ class DinoAttentionExtractor(nn.Module):
             )
         return (images - self.pixel_mean) / self.pixel_std
 
-    def forward(self, images):
+    def forward(self, images, return_cls_attn=False):
         self._last_attention = None
         proc = self._preprocess(images)
         _ = self.model(proc)
@@ -74,6 +74,8 @@ class DinoAttentionExtractor(nn.Module):
         attn_map = cls_to_patch.view(images.shape[0], 1, grid, grid)
         attn_map = attn_map - attn_map.amin(dim=(2, 3), keepdim=True)
         attn_map = attn_map / attn_map.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        if return_cls_attn:
+            return attn_map, cls_to_patch
         return attn_map
 
     def close(self):
