@@ -216,6 +216,12 @@ class DualVelocityStructModel(BaseModel):
                             help="weight for paired structure feature consistency loss")
         parser.add_argument("--lambda_phi_attn", type=float, default=1.0,
                             help="weight for phi(attn_mri) -> attn_ct supervision during phi pretraining")
+        parser.add_argument("--phi_gen_mode", type=str, default="direct", choices=["direct", "fm"],
+                    help="Phi generation mode: direct mapping or FM (flow matching) integration")
+        parser.add_argument("--phi_fm_steps", type=int, default=4,
+                    help="Euler integration steps used when phi_gen_mode=fm")
+        parser.add_argument("--phi_fm_train_noise", type=float, default=0.0,
+                    help="Gaussian noise std added to x_t during FM training")
         parser.add_argument("--phi_loss_mode", type=str, default="kl_cos_l1", choices=["kl_cos_l1", "kl", "clip", "kl_clip"],
                 help="Phi supervision mode; default uses KL + cosine + L1")
         parser.add_argument("--phi_aux_mse_weight", type=float, default=0.0,
@@ -291,6 +297,7 @@ class DualVelocityStructModel(BaseModel):
 
         self.phi_condition_mode = str(getattr(opt, "phi_condition_mode", "none")).strip().lower()
         self.use_phi_film = self.phi_condition_mode == "film"
+        self.phi_gen_mode = str(getattr(opt, "phi_gen_mode", "direct")).strip().lower()
 
         self.loss_names = [
             "G_GAN",
@@ -696,6 +703,30 @@ class DualVelocityStructModel(BaseModel):
         total_loss = main_loss
         return total_loss, main_loss, loss_l1, loss_kl, loss_cos
 
+    def _phi_predict_velocity(self, attn_xt, cond_images=None, net_phi=None, net_phi_cond=None):
+        net_phi = self.netPhi if net_phi is None else net_phi
+        attn_xt = self._apply_phi_condition(attn_xt, cond_images, net_phi_cond=net_phi_cond)
+        return net_phi(attn_xt)
+
+    def _phi_generate_attention_fm(self, attn_start, cond_images=None, net_phi=None, net_phi_cond=None, steps=None):
+        steps = max(1, int(self.opt.phi_fm_steps if steps is None else steps))
+        dt = 1.0 / float(steps)
+        xt = attn_start
+        for _ in range(steps):
+            v = self._phi_predict_velocity(xt, cond_images=cond_images, net_phi=net_phi, net_phi_cond=net_phi_cond)
+            xt = xt + dt * v
+        return xt
+
+    def _compute_phi_fm_loss(self, attn_mri_map, attn_ct_map, cond_images=None):
+        t = torch.rand(attn_mri_map.size(0), 1, 1, 1, device=attn_mri_map.device, dtype=attn_mri_map.dtype)
+        xt = (1.0 - t) * attn_mri_map + t * attn_ct_map
+        noise_std = float(getattr(self.opt, "phi_fm_train_noise", 0.0))
+        if noise_std > 0:
+            xt = xt + noise_std * torch.randn_like(xt)
+        v_target = attn_ct_map - attn_mri_map
+        v_pred = self._phi_predict_velocity(xt, cond_images=cond_images)
+        return F.mse_loss(v_pred, v_target)
+
     def _maybe_load_best_phi_by_phase_loss(self):
         if self.opt.isTrain and self.opt.pretrained_name is not None:
             load_dir = os.path.join(self.opt.checkpoints_dir, self.opt.pretrained_name)
@@ -959,8 +990,16 @@ class DualVelocityStructModel(BaseModel):
     def _predict_target_attention(self, images_A, net_phi=None, net_phi_cond=None, detach=False, image_paths=None):
         net_phi = self.netPhi if net_phi is None else net_phi
         attn_mri = self._extract_attention_map(images_A, image_paths=image_paths)
-        attn_mri = self._apply_phi_condition(attn_mri, images_A, net_phi_cond=net_phi_cond)
-        attn_ct_pred = net_phi(attn_mri)
+        if self.phi_gen_mode == "fm":
+            attn_ct_pred = self._phi_generate_attention_fm(
+                attn_mri,
+                cond_images=images_A,
+                net_phi=net_phi,
+                net_phi_cond=net_phi_cond,
+            )
+        else:
+            attn_mri = self._apply_phi_condition(attn_mri, images_A, net_phi_cond=net_phi_cond)
+            attn_ct_pred = net_phi(attn_mri)
         if detach:
             attn_ct_pred = attn_ct_pred.detach()
         return attn_ct_pred
@@ -1059,15 +1098,22 @@ class DualVelocityStructModel(BaseModel):
         with torch.no_grad():
             attn_mri_map, _ = self._extract_attention_features(images_A, image_paths=image_paths_A)
             attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B, image_paths=image_paths_B)
-        attn_mri_map = self._apply_phi_condition(attn_mri_map, images_A)
-        pred_ct = self.netPhi(attn_mri_map)
-        total_loss, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
-            pred_ct,
-            attn_ct_map,
-            attn_ct_cls,
-            patient_ids,
-            slice_indices,
-        )
+        if self.phi_gen_mode == "fm":
+            total_loss = self._compute_phi_fm_loss(attn_mri_map, attn_ct_map, cond_images=images_A)
+            main_loss = total_loss
+            loss_l1 = torch.zeros_like(total_loss)
+            loss_kl = torch.zeros_like(total_loss)
+            loss_cos = torch.zeros_like(total_loss)
+        else:
+            attn_mri_map = self._apply_phi_condition(attn_mri_map, images_A)
+            pred_ct = self.netPhi(attn_mri_map)
+            total_loss, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
+                pred_ct,
+                attn_ct_map,
+                attn_ct_cls,
+                patient_ids,
+                slice_indices,
+            )
         (self.opt.lambda_phi_attn * total_loss).backward()
         self.optimizer_Phi.step()
         self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach())
