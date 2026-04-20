@@ -17,7 +17,7 @@ def _normalize_phi_best_metric(metric):
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
     phi_best_metric = _normalize_phi_best_metric(getattr(opt, "phi_best_metric", "main"))
-    valid_phi_metrics = {"main", "mse", "avg", "ema", "kl", "clip"}
+    valid_phi_metrics = {"main", "l1", "avg", "ema", "kl", "cos", "mse", "clip"}
     if phi_best_metric not in valid_phi_metrics:
         raise ValueError(
             f"Unsupported --phi_best_metric={phi_best_metric}. "
@@ -103,21 +103,25 @@ if __name__ == '__main__':
 
             key_map = {
                 "main": "phi_epoch_main_loss",
-                "mse": "phi_epoch_mse_loss",
+                "l1": "phi_epoch_l1_loss",
+                "mse": "phi_epoch_l1_loss",
                 "avg": "phi_epoch_avg_loss",
                 "ema": "phi_pretrain_ema_loss",
                 "kl": "phi_epoch_kl_loss",
-                "clip": "phi_epoch_clip_loss",
+                "cos": "phi_epoch_cos_loss",
+                "clip": "phi_epoch_cos_loss",
             }
             loss = state.get(key_map[phi_best_metric], None)
             # Backward-compatible fallback for older checkpoints.
             if loss is None:
                 for fallback_key in (
                     "phi_epoch_main_loss",
+                    "phi_epoch_l1_loss",
                     "phi_epoch_mse_loss",
                     "phi_epoch_avg_loss",
                     "phi_pretrain_ema_loss",
                     "phi_epoch_kl_loss",
+                    "phi_epoch_cos_loss",
                     "phi_epoch_clip_loss",
                 ):
                     loss = state.get(fallback_key, None)
@@ -239,11 +243,13 @@ if __name__ == '__main__':
 
         phi_getter_name = {
             "main": "get_phi_epoch_main_loss",
-            "mse": "get_phi_epoch_mse_loss",
+            "l1": "get_phi_epoch_l1_loss",
+            "mse": "get_phi_epoch_l1_loss",
             "avg": "get_phi_epoch_avg_loss",
             "ema": None,
             "kl": "get_phi_epoch_kl_loss",
-            "clip": "get_phi_epoch_clip_loss",
+            "cos": "get_phi_epoch_cos_loss",
+            "clip": "get_phi_epoch_cos_loss",
         }[phi_best_metric]
         if phi_best_metric == "ema":
             phi_epoch_loss = getattr(model, "phi_pretrain_ema_loss", None)
