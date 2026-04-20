@@ -31,6 +31,31 @@ class StructureFeatureExtractor(nn.Module):
         return self.net(x)
 
 
+class PhiFilmConditioner(nn.Module):
+    """Lightweight FiLM parameter generator conditioned on original MRI."""
+
+    def __init__(self, in_channels=1, film_channels=1, hidden_channels=16):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.to_gamma_beta = nn.Linear(hidden_channels, film_channels * 2)
+        nn.init.zeros_(self.to_gamma_beta.weight)
+        nn.init.zeros_(self.to_gamma_beta.bias)
+
+    def forward(self, cond_image):
+        feat = self.encoder(cond_image).flatten(1)
+        gamma_beta = self.to_gamma_beta(feat)
+        gamma, beta = torch.chunk(gamma_beta, chunks=2, dim=1)
+        return gamma.unsqueeze(-1).unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
+
+
 class ViTEncoderBlock(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
@@ -191,8 +216,8 @@ class DualVelocityStructModel(BaseModel):
                             help="weight for paired structure feature consistency loss")
         parser.add_argument("--lambda_phi_attn", type=float, default=1.0,
                             help="weight for phi(attn_mri) -> attn_ct supervision during phi pretraining")
-        parser.add_argument("--phi_loss_mode", type=str, default="kl_clip", choices=["kl", "clip", "kl_clip"],
-                    help="Phi supervision mode: KL only, CLIP only, or KL+CLIP")
+        parser.add_argument("--phi_loss_mode", type=str, default="kl_cos_l1", choices=["kl_cos_l1", "kl", "clip", "kl_clip"],
+                help="Phi supervision mode; default uses KL + cosine + L1")
         parser.add_argument("--phi_aux_mse_weight", type=float, default=0.0,
                     help="optional auxiliary MSE weight on normalized Phi attention map")
         parser.add_argument("--phi_kl_temperature", type=float, default=1.0,
@@ -203,6 +228,16 @@ class DualVelocityStructModel(BaseModel):
                     help="distance decay scale for same-patient positive weights in CLIP loss")
         parser.add_argument("--phi_clip_queue_size", type=int, default=512,
                     help="number of CT attention embeddings cached for CLIP loss")
+        parser.add_argument("--phi_condition_mode", type=str, default="none", choices=["none", "film"],
+                help="conditioning mode for Phi branch (default: none, keep original behavior)")
+        parser.add_argument("--phi_film_hidden_channels", type=int, default=16,
+                help="hidden channels for lightweight FiLM conditioner when phi_condition_mode=film")
+        parser.add_argument("--lambda_phi_kl", type=float, default=1.0,
+                help="weight for KL term in Phi supervision")
+        parser.add_argument("--lambda_phi_cos", type=float, default=1.0,
+                help="weight for cosine term in Phi supervision")
+        parser.add_argument("--lambda_phi_l1", type=float, default=1.0,
+                help="weight for L1 term in Phi supervision")
         parser.add_argument("--v0_stopgrad_phi", type=util.str2bool, nargs="?", const=True, default=True,
                             help="stop gradients to net_A when computing distilled V0 labels")
         parser.add_argument("--phi_hidden_channels", type=int, default=32,
@@ -216,7 +251,7 @@ class DualVelocityStructModel(BaseModel):
         parser.add_argument("--phi_pretrain_ema_momentum", type=float, default=0.9,
                             help="EMA momentum used for phi loss early-stop tracking")
         parser.add_argument("--phi_best_metric", type=str, default="main",
-                    choices=["main", "mse", "avg", "ema", "kl", "clip"],
+                choices=["main", "l1", "avg", "ema", "kl", "cos", "mse", "clip"],
                     help="metric used to select best_phi checkpoint during phi pretraining")
         parser.add_argument("--auto_load_best_phi", type=util.str2bool, nargs="?", const=True, default=True,
                     help="when resuming, replace netPhi with checkpoint from epoch having minimum phi_pretrain_ema_loss")
@@ -254,6 +289,9 @@ class DualVelocityStructModel(BaseModel):
     def __init__(self, opt):
         BaseModel.__init__(self, opt)
 
+        self.phi_condition_mode = str(getattr(opt, "phi_condition_mode", "none")).strip().lower()
+        self.use_phi_film = self.phi_condition_mode == "film"
+
         self.loss_names = [
             "G_GAN",
             "D_real",
@@ -267,9 +305,9 @@ class DualVelocityStructModel(BaseModel):
             "G_pair",
             "G_v0_match",
             "G_phi_main",
-            "G_phi_mse",
+            "G_phi_l1",
             "G_phi_kl",
-            "G_phi_clip",
+            "G_phi_cos",
             "G_phi_pair",
             "G_total",
         ]
@@ -284,10 +322,14 @@ class DualVelocityStructModel(BaseModel):
 
         if self.isTrain:
             self.model_names = ["G", "Gen", "Phi", "D"]
+            if self.use_phi_film:
+                self.model_names.insert(3, "PhiCond")
             if self.use_learned_struct:
                 self.model_names.insert(3, "VStruct")
         else:
             self.model_names = ["G", "Gen", "Phi"]
+            if self.use_phi_film:
+                self.model_names.append("PhiCond")
             if self.use_learned_struct:
                 self.model_names.append("VStruct")
 
@@ -321,6 +363,18 @@ class DualVelocityStructModel(BaseModel):
             self.gpu_ids,
         )
         self.netA = self.netPhi
+        self.netPhiCond = None
+        if self.use_phi_film:
+            self.netPhiCond = networks.init_net(
+                PhiFilmConditioner(
+                    in_channels=max(1, int(opt.input_nc)),
+                    film_channels=1,
+                    hidden_channels=max(4, int(getattr(opt, "phi_film_hidden_channels", 16))),
+                ),
+                opt.init_type,
+                opt.init_gain,
+                self.gpu_ids,
+            )
         self.dino_extractor = DinoAttentionExtractor(
             model_name=opt.dino_model_name,
             image_size=opt.dino_image_size,
@@ -385,7 +439,10 @@ class DualVelocityStructModel(BaseModel):
                 lr=opt.lr,
                 betas=(opt.beta1, opt.beta2),
             )
-            self.optimizer_Phi = torch.optim.Adam(self.netPhi.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            phi_params = list(self.netPhi.parameters())
+            if self.netPhiCond is not None:
+                phi_params += list(self.netPhiCond.parameters())
+            self.optimizer_Phi = torch.optim.Adam(phi_params, lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizer_A = self.optimizer_Phi
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizers.extend([self.optimizer_gen, self.optimizer_Phi, self.optimizer_D])
@@ -399,9 +456,9 @@ class DualVelocityStructModel(BaseModel):
         self.phi_pretrain_ema_loss = None
         self.phi_epoch_avg_loss = None
         self.phi_epoch_main_loss = None
-        self.phi_epoch_mse_loss = None
+        self.phi_epoch_l1_loss = None
         self.phi_epoch_kl_loss = None
-        self.phi_epoch_clip_loss = None
+        self.phi_epoch_cos_loss = None
         self._phi_epoch_loss_sum = 0.0
         self._phi_epoch_loss_sq_sum = 0.0
         self._phi_epoch_loss_count = 0
@@ -422,9 +479,9 @@ class DualVelocityStructModel(BaseModel):
             "phi_pretrain_ema_loss": self.phi_pretrain_ema_loss,
             "phi_epoch_avg_loss": self.phi_epoch_avg_loss,
             "phi_epoch_main_loss": self.phi_epoch_main_loss,
-            "phi_epoch_mse_loss": self.phi_epoch_mse_loss,
+            "phi_epoch_l1_loss": self.phi_epoch_l1_loss,
             "phi_epoch_kl_loss": self.phi_epoch_kl_loss,
-            "phi_epoch_clip_loss": self.phi_epoch_clip_loss,
+            "phi_epoch_cos_loss": self.phi_epoch_cos_loss,
         }
         torch.save(phase_state, self._phase_state_path(epoch))
 
@@ -437,9 +494,9 @@ class DualVelocityStructModel(BaseModel):
             self.phi_pretrain_ema_loss = phase_state.get("phi_pretrain_ema_loss", None)
             self.phi_epoch_avg_loss = phase_state.get("phi_epoch_avg_loss", None)
             self.phi_epoch_main_loss = phase_state.get("phi_epoch_main_loss", None)
-            self.phi_epoch_mse_loss = phase_state.get("phi_epoch_mse_loss", None)
+            self.phi_epoch_l1_loss = phase_state.get("phi_epoch_l1_loss", phase_state.get("phi_epoch_mse_loss", None))
             self.phi_epoch_kl_loss = phase_state.get("phi_epoch_kl_loss", None)
-            self.phi_epoch_clip_loss = phase_state.get("phi_epoch_clip_loss", None)
+            self.phi_epoch_cos_loss = phase_state.get("phi_epoch_cos_loss", phase_state.get("phi_epoch_clip_loss", None))
 
         if self.isTrain and bool(getattr(self.opt, "continue_train", False)) and bool(getattr(self.opt, "auto_load_best_phi", False)):
             self._maybe_load_best_phi_by_phase_loss()
@@ -454,9 +511,9 @@ class DualVelocityStructModel(BaseModel):
         self._phi_epoch_main_loss_count = 0
         self.phi_epoch_avg_loss = None
         self.phi_epoch_main_loss = None
-        self.phi_epoch_mse_loss = None
+        self.phi_epoch_l1_loss = None
         self.phi_epoch_kl_loss = None
-        self.phi_epoch_clip_loss = None
+        self.phi_epoch_cos_loss = None
 
     def get_phi_epoch_avg_loss(self):
         if self._phi_epoch_loss_count <= 0:
@@ -468,7 +525,7 @@ class DualVelocityStructModel(BaseModel):
             return None
         return self._phi_epoch_main_loss_sum / float(self._phi_epoch_main_loss_count)
 
-    def get_phi_epoch_mse_loss(self):
+    def get_phi_epoch_l1_loss(self):
         if self._phi_epoch_loss_count <= 0:
             return None
         return self._phi_epoch_loss_sq_sum / float(self._phi_epoch_loss_count)
@@ -476,8 +533,15 @@ class DualVelocityStructModel(BaseModel):
     def get_phi_epoch_kl_loss(self):
         return self.phi_epoch_kl_loss
 
+    def get_phi_epoch_cos_loss(self):
+        return self.phi_epoch_cos_loss
+
+    # Backward-compatible aliases
+    def get_phi_epoch_mse_loss(self):
+        return self.get_phi_epoch_l1_loss()
+
     def get_phi_epoch_clip_loss(self):
-        return self.phi_epoch_clip_loss
+        return self.get_phi_epoch_cos_loss()
 
     @staticmethod
     def _to_python_str_list(value):
@@ -500,12 +564,19 @@ class DualVelocityStructModel(BaseModel):
     @staticmethod
     def _normalize_attention_distribution(logits, temperature=1.0, eps=1e-8):
         scaled = logits / max(float(temperature), eps)
-        return torch.softmax(scaled, dim=-1)
+        scaled = scaled - scaled.amin(dim=-1, keepdim=True)
+        scaled = scaled + eps
+        return scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(eps)
 
     @staticmethod
     def _sum_normalize_attention(prob, eps=1e-8):
         prob = prob.clamp_min(eps)
         return prob / prob.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    @staticmethod
+    def _minmax_normalize_attention(prob, eps=1e-8):
+        prob = prob - prob.amin(dim=-1, keepdim=True)
+        return prob / prob.amax(dim=-1, keepdim=True).clamp_min(eps)
 
     def _extract_attention_features(self, images):
         attn_map, cls_attn = self.dino_extractor(images, return_cls_attn=True)
@@ -553,16 +624,18 @@ class DualVelocityStructModel(BaseModel):
 
     def _compute_phi_kl_loss(self, pred_map, target_cls, temperature=None):
         temp = float(self.opt.phi_kl_temperature if temperature is None else temperature)
-        pred_prob = self._normalize_attention_distribution(self._phi_attention_logits(pred_map), temperature=temp)
-        target_prob = self._sum_normalize_attention(target_cls)
+        pred_logits = self._phi_attention_logits(self._normalize_struct_features(pred_map))
+        target_logits = self._minmax_normalize_attention(target_cls)
+        pred_prob = self._normalize_attention_distribution(pred_logits, temperature=temp)
+        target_prob = self._sum_normalize_attention(target_logits)
         return F.kl_div(torch.log(pred_prob.clamp_min(1e-8)), target_prob, reduction="batchmean")
 
     def _compute_phi_clip_loss(self, pred_map, target_cls, patient_ids, slice_indices):
         temp = float(self.opt.phi_clip_temperature)
         sigma = max(float(self.opt.phi_clip_distance_sigma), 1e-6)
-        anchor_prob = self._phi_attention_prob(pred_map, temperature=1.0)
+        anchor_prob = self._phi_attention_prob(self._normalize_struct_features(pred_map), temperature=1.0)
         candidate_probs, candidate_patient_ids, candidate_slice_indices = self._build_phi_clip_candidate_bank(
-            self._sum_normalize_attention(target_cls),
+            self._sum_normalize_attention(self._minmax_normalize_attention(target_cls)),
             patient_ids,
             slice_indices,
         )
@@ -599,22 +672,29 @@ class DualVelocityStructModel(BaseModel):
         return torch.stack(losses).mean()
 
     def _compute_phi_supervision_losses(self, pred_map, target_map, target_cls, patient_ids, slice_indices):
-        loss_mse = F.mse_loss(self._normalize_struct_features(pred_map), self._normalize_struct_features(target_map))
+        pred_norm = self._normalize_struct_features(pred_map)
+        target_norm = self._normalize_struct_features(target_map)
+        loss_l1 = F.l1_loss(pred_norm, target_norm)
+        loss_cos = (1.0 - F.cosine_similarity(pred_norm.flatten(1), target_norm.flatten(1), dim=1, eps=1e-8)).mean()
         loss_kl = self._compute_phi_kl_loss(pred_map, target_cls)
-        loss_clip = self._compute_phi_clip_loss(pred_map, target_cls, patient_ids, slice_indices)
+        _ = self._compute_phi_clip_loss(pred_map, target_cls, patient_ids, slice_indices)
 
-        mode = str(getattr(self.opt, "phi_loss_mode", "kl_clip"))
-        if mode == "kl":
-            main_loss = loss_kl
+        lambda_kl = float(getattr(self.opt, "lambda_phi_kl", 1.0))
+        lambda_cos = float(getattr(self.opt, "lambda_phi_cos", 1.0))
+        lambda_l1 = float(getattr(self.opt, "lambda_phi_l1", 1.0))
+
+        mode = str(getattr(self.opt, "phi_loss_mode", "kl_cos_l1"))
+        if mode in {"kl_cos_l1", "kl_clip"}:
+            main_loss = lambda_kl * loss_kl + lambda_cos * loss_cos + lambda_l1 * loss_l1
+        elif mode == "kl":
+            main_loss = lambda_kl * loss_kl
         elif mode == "clip":
-            main_loss = loss_clip
-        elif mode == "kl_clip":
-            main_loss = loss_kl + loss_clip
+            main_loss = lambda_cos * loss_cos
         else:
             raise ValueError(f"Unsupported phi_loss_mode: {mode}")
 
-        total_loss = main_loss + float(getattr(self.opt, "phi_aux_mse_weight", 0.0)) * loss_mse
-        return total_loss, main_loss, loss_mse, loss_kl, loss_clip
+        total_loss = main_loss
+        return total_loss, main_loss, loss_l1, loss_kl, loss_cos
 
     def _maybe_load_best_phi_by_phase_loss(self):
         if self.opt.isTrain and self.opt.pretrained_name is not None:
@@ -644,8 +724,8 @@ class DualVelocityStructModel(BaseModel):
             loss = state.get("phi_epoch_main_loss", None)
             loss_name = "main_loss"
             if loss is None:
-                loss = state.get("phi_epoch_mse_loss", None)
-                loss_name = "mse_loss"
+                loss = state.get("phi_epoch_l1_loss", state.get("phi_epoch_mse_loss", None))
+                loss_name = "l1_loss"
             if loss is None:
                 loss = state.get("phi_epoch_avg_loss", None)
                 loss_name = "avg_loss"
@@ -694,9 +774,9 @@ class DualVelocityStructModel(BaseModel):
         self.loss_G_pair = zero
         self.loss_G_v0_match = zero
         self.loss_G_phi_main = zero
-        self.loss_G_phi_mse = zero
+        self.loss_G_phi_l1 = zero
         self.loss_G_phi_kl = zero
-        self.loss_G_phi_clip = zero
+        self.loss_G_phi_cos = zero
         self.loss_G_phi_pair = zero
         self.loss_G_total = zero
 
@@ -754,13 +834,22 @@ class DualVelocityStructModel(BaseModel):
     def _unwrap_module(net):
         return net.module if isinstance(net, torch.nn.DataParallel) else net
 
+    def _apply_phi_condition(self, attn_map, cond_image, net_phi_cond=None):
+        if (not self.use_phi_film) or cond_image is None:
+            return attn_map
+        net_phi_cond = self.netPhiCond if net_phi_cond is None else net_phi_cond
+        if net_phi_cond is None:
+            return attn_map
+        gamma, beta = net_phi_cond(cond_image)
+        return attn_map * (1.0 + gamma) + beta
+
     def _build_attention_map(self, images_A):
         with torch.no_grad():
             attn = self.dino_extractor(images_A)
+            attn = self._apply_phi_condition(attn, images_A)
             attn = self.netPhi(attn)
             attn = F.interpolate(attn, size=self.real_A.shape[2:], mode="bilinear", align_corners=False)
-            attn = attn / (attn.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6))
-            return attn * 2.0 - 1.0
+            return self._normalize_struct_features(attn)
 
     @staticmethod
     def _set_trainable(net, flag):
@@ -786,8 +875,10 @@ class DualVelocityStructModel(BaseModel):
         return v_g * float(self.opt.vgen_scale)
 
     def _normalize_struct_features(self, feat):
-        denom = feat.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(float(self.opt.attn_norm_eps))
-        return feat / denom
+        eps = float(self.opt.attn_norm_eps)
+        feat_min = feat.amin(dim=(1, 2, 3), keepdim=True)
+        feat_max = feat.amax(dim=(1, 2, 3), keepdim=True)
+        return (feat - feat_min) / (feat_max - feat_min).clamp_min(eps)
 
     def _dino_cache_file_path(self, image_path):
         if self.dino_cache_dir is None:
@@ -865,9 +956,10 @@ class DualVelocityStructModel(BaseModel):
 
         return attn_map_online, cls_attn_online
 
-    def _predict_target_attention(self, images_A, net_phi=None, detach=False, image_paths=None):
+    def _predict_target_attention(self, images_A, net_phi=None, net_phi_cond=None, detach=False, image_paths=None):
         net_phi = self.netPhi if net_phi is None else net_phi
         attn_mri = self._extract_attention_map(images_A, image_paths=image_paths)
+        attn_mri = self._apply_phi_condition(attn_mri, images_A, net_phi_cond=net_phi_cond)
         attn_ct_pred = net_phi(attn_mri)
         if detach:
             attn_ct_pred = attn_ct_pred.detach()
@@ -923,11 +1015,11 @@ class DualVelocityStructModel(BaseModel):
                 param.requires_grad = flag
         return v0.detach()
 
-    def _record_phi_epoch_metrics(self, main_loss, mse_loss, kl_loss, clip_loss):
+    def _record_phi_epoch_metrics(self, main_loss, l1_loss, kl_loss, cos_loss):
         main_val = float(main_loss.item())
-        mse_val = float(mse_loss.item())
+        l1_val = float(l1_loss.item())
         kl_val = float(kl_loss.item())
-        clip_val = float(clip_loss.item())
+        cos_val = float(cos_loss.item())
 
         self._phi_epoch_main_loss_sum += main_val
         self._phi_epoch_main_loss_sq_sum += main_val * main_val
@@ -939,9 +1031,9 @@ class DualVelocityStructModel(BaseModel):
         self._phi_epoch_loss_count += 1
         self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
 
-        self.phi_epoch_mse_loss = mse_val if self.phi_epoch_mse_loss is None else (0.5 * self.phi_epoch_mse_loss + 0.5 * mse_val)
+        self.phi_epoch_l1_loss = l1_val if self.phi_epoch_l1_loss is None else (0.5 * self.phi_epoch_l1_loss + 0.5 * l1_val)
         self.phi_epoch_kl_loss = kl_val if self.phi_epoch_kl_loss is None else (0.5 * self.phi_epoch_kl_loss + 0.5 * kl_val)
-        self.phi_epoch_clip_loss = clip_val if self.phi_epoch_clip_loss is None else (0.5 * self.phi_epoch_clip_loss + 0.5 * clip_val)
+        self.phi_epoch_cos_loss = cos_val if self.phi_epoch_cos_loss is None else (0.5 * self.phi_epoch_cos_loss + 0.5 * cos_val)
 
     def _phi_pretrain_step(self, images_A, images_B, patient_ids, slice_indices, image_paths_A=None, image_paths_B=None):
         if not self.isTrain:
@@ -951,6 +1043,8 @@ class DualVelocityStructModel(BaseModel):
         self._set_trainable(self.netG, False)
         self._set_trainable(self.netGen, False)
         self._set_trainable(self.netPhi, True)
+        if self.netPhiCond is not None:
+            self._set_trainable(self.netPhiCond, True)
         if self.netVStruct is not None:
             self._set_trainable(self.netVStruct, False)
         self._set_trainable(self.netD, False)
@@ -965,8 +1059,9 @@ class DualVelocityStructModel(BaseModel):
         with torch.no_grad():
             attn_mri_map, _ = self._extract_attention_features(images_A, image_paths=image_paths_A)
             attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B, image_paths=image_paths_B)
+        attn_mri_map = self._apply_phi_condition(attn_mri_map, images_A)
         pred_ct = self.netPhi(attn_mri_map)
-        total_loss, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
+        total_loss, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
             pred_ct,
             attn_ct_map,
             attn_ct_cls,
@@ -975,13 +1070,13 @@ class DualVelocityStructModel(BaseModel):
         )
         (self.opt.lambda_phi_attn * total_loss).backward()
         self.optimizer_Phi.step()
-        self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach())
         self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), patient_ids, slice_indices)
 
         self.loss_G_phi_main = main_loss.detach()
-        self.loss_G_phi_mse = loss_mse.detach()
+        self.loss_G_phi_l1 = loss_l1.detach()
         self.loss_G_phi_kl = loss_kl.detach()
-        self.loss_G_phi_clip = loss_clip.detach()
+        self.loss_G_phi_cos = loss_cos.detach()
         return total_loss.detach()
 
     def inference(self, latents_A, source_images=None, use_structure=True, detach_vg=False, net_gen=None, net_a=None, net_v_struct=None):
@@ -1156,7 +1251,7 @@ class DualVelocityStructModel(BaseModel):
             latent_A, latent_B, _ = self._encode_latents(images_A, images_B, use_noise=False)
             ref_attn = self._predict_target_attention(images_A, detach=True, image_paths=pair_paths_A)
             attn_ct_map, attn_ct_cls = self._extract_attention_features(images_B, image_paths=pair_paths_B)
-        loss_phi_pair, main_loss, loss_mse, loss_kl, loss_clip = self._compute_phi_supervision_losses(
+        loss_phi_pair, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
             ref_attn,
             attn_ct_map,
             attn_ct_cls,
@@ -1202,10 +1297,10 @@ class DualVelocityStructModel(BaseModel):
             self.optimizer_V_struct.step()
 
         self.loss_G_phi_main = main_loss.detach()
-        self.loss_G_phi_mse = loss_mse.detach()
+        self.loss_G_phi_l1 = loss_l1.detach()
         self.loss_G_phi_kl = loss_kl.detach()
-        self.loss_G_phi_clip = loss_clip.detach()
-        self._record_phi_epoch_metrics(main_loss.detach(), loss_mse.detach(), loss_kl.detach(), loss_clip.detach())
+        self.loss_G_phi_cos = loss_cos.detach()
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach())
         self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), pair_patient_ids, pair_slice_indices)
 
         return {
@@ -1290,7 +1385,7 @@ class DualVelocityStructModel(BaseModel):
                     self._phi_epoch_loss_sq_sum += phi_loss_val * phi_loss_val
                     self._phi_epoch_loss_count += 1
                     self.phi_epoch_avg_loss = self.get_phi_epoch_avg_loss()
-                    self.phi_epoch_mse_loss = self.get_phi_epoch_mse_loss()
+                    self.phi_epoch_l1_loss = self.get_phi_epoch_l1_loss()
                     self.phi_epoch_main_loss = self.get_phi_epoch_main_loss()
             self.loss_G_phi_pair = phi_loss if phi_loss is not None else torch.tensor(0.0, device=self.device)
             self.loss_G_total = self.loss_G_phi_pair
@@ -1305,6 +1400,8 @@ class DualVelocityStructModel(BaseModel):
             self._set_trainable(self.netG, True)
             self._set_trainable(self.netGen, True)
             self._set_trainable(self.netPhi, False)
+            if self.netPhiCond is not None:
+                self._set_trainable(self.netPhiCond, False)
             if self.netVStruct is not None:
                 self._set_trainable(self.netVStruct, False)
             result = self._unpaired_step(self.real_A, self.real_B, use_structure=False)
@@ -1334,6 +1431,8 @@ class DualVelocityStructModel(BaseModel):
             self._set_trainable(self.netG, True)
             self._set_trainable(self.netGen, True)
             self._set_trainable(self.netPhi, False)
+            if self.netPhiCond is not None:
+                self._set_trainable(self.netPhiCond, False)
             if self.netVStruct is not None:
                 self._set_trainable(self.netVStruct, True)
             unpaired_result = self._unpaired_step(self.real_A[unpaired_mask], self.real_B[unpaired_mask], use_structure=True)
