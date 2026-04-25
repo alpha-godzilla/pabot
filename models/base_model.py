@@ -1,4 +1,5 @@
 import os
+import tempfile
 import torch
 from collections import OrderedDict
 from abc import ABC, abstractmethod
@@ -168,6 +169,30 @@ class BaseModel(ABC):
     def get_epoch(self):
         return self.current_epoch
 
+    @staticmethod
+    def _atomic_torch_save(obj, save_path):
+        """Write a torch object atomically and fall back to legacy serialization if needed."""
+        save_dir = os.path.dirname(save_path)
+        os.makedirs(save_dir, exist_ok=True)
+
+        fd, tmp_path = tempfile.mkstemp(dir=save_dir, prefix=".tmp_", suffix=".pth")
+        os.close(fd)
+        try:
+            try:
+                torch.save(obj, tmp_path)
+            except Exception as first_exc:
+                try:
+                    torch.save(obj, tmp_path, _use_new_zipfile_serialization=False)
+                except Exception:
+                    raise first_exc
+            os.replace(tmp_path, save_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     def save_networks(self, epoch):
         """Save all the networks to the disk.
 
@@ -182,7 +207,7 @@ class BaseModel(ABC):
 
                 # DataParallel wraps the real module at .module; single-GPU nets do not.
                 save_net = net.module if isinstance(net, torch.nn.DataParallel) else net
-                torch.save(save_net.cpu().state_dict(), save_path)
+                self._atomic_torch_save(save_net.cpu().state_dict(), save_path)
 
                 # Move back to the original training device after saving.
                 if len(self.gpu_ids) > 0 and torch.cuda.is_available():

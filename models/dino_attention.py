@@ -52,10 +52,10 @@ class DinoAttentionExtractor(nn.Module):
             )
         return (images - self.pixel_mean) / self.pixel_std
 
-    def forward(self, images, return_cls_attn=False):
+    def forward(self, images, return_cls_attn=False, return_patch_feat=False):
         self._last_attention = None
         proc = self._preprocess(images)
-        _ = self.model(proc)
+        tokens = self.model.get_intermediate_layers(proc, n=1)[0]
         if self._last_attention is None:
             raise RuntimeError("DINO attention hook did not capture any tensor.")
 
@@ -74,8 +74,20 @@ class DinoAttentionExtractor(nn.Module):
         attn_map = cls_to_patch.view(images.shape[0], 1, grid, grid)
         attn_map = attn_map - attn_map.amin(dim=(2, 3), keepdim=True)
         attn_map = attn_map / attn_map.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        patch_feat = None
+        if return_patch_feat:
+            patch_tokens = tokens[:, 1:, :]
+            if patch_tokens.shape[1] != grid * grid:
+                raise RuntimeError(
+                    f"Patch tokens ({patch_tokens.shape[1]}) do not match attention grid ({grid * grid})."
+                )
+            patch_feat = patch_tokens.transpose(1, 2).contiguous().view(images.shape[0], patch_tokens.shape[-1], grid, grid)
         if return_cls_attn:
+            if return_patch_feat:
+                return attn_map, cls_to_patch, patch_feat
             return attn_map, cls_to_patch
+        if return_patch_feat:
+            return attn_map, patch_feat
         return attn_map
 
     def close(self):

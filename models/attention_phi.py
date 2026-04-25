@@ -1,93 +1,87 @@
 import torch
 import torch.nn as nn
-
-
-class LightweightSpatialAttention(nn.Module):
-    """Token attention on small attention maps (e.g., 28x28) with low overhead."""
-
-    def __init__(self, channels, num_heads=4):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.norm = nn.GroupNorm(1, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        n = h * w
-
-        qkv = self.qkv(self.norm(x))
-        q, k, v = torch.chunk(qkv, chunks=3, dim=1)
-
-        q = q.view(b, self.num_heads, self.head_dim, n).transpose(-2, -1)
-        k = k.view(b, self.num_heads, self.head_dim, n).transpose(-2, -1)
-        v = v.view(b, self.num_heads, self.head_dim, n).transpose(-2, -1)
-
-        attn = torch.softmax((q * self.scale) @ k.transpose(-2, -1), dim=-1)
-        out = attn @ v
-        out = out.transpose(-2, -1).contiguous().view(b, c, h, w)
-        return self.proj(out)
-
+import torch.nn.functional as F
 
 class AttentionPhi(nn.Module):
-    """Residual CNN + lightweight attention + post gate.
-
-    Learns delta first, then applies suppression gate on Y = A + delta:
-        output = (1 - G) * Y
-    where G in [0, 1] is predicted from [A, delta, |delta|].
+    """Transformer-based Attention Generator (SpatialAttentionGenerator).
+    Maps DINO features (B, 768, 28, 28) to CT Attention Map (B, 1, 28, 28).
     """
-
-    def __init__(self, in_channels=1, hidden_channels=32, attn_heads=4):
+    def __init__(self, in_channels=768, d_model=256, nhead=8, num_layers=4, dim_feedforward=1024):
         super().__init__()
-
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(hidden_channels),
-            nn.SiLU(inplace=True),
+        
+        # 2. 线性降维 (Projection)
+        self.input_proj = nn.Linear(in_channels, d_model)
+        
+        # 3. 可学习的位置编码 (Positional Encoding) for 28x28 grid
+        self.pos_embed = nn.Parameter(torch.zeros(1, 784, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # 4. 自注意力特征提取 (Transformer Encoder)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            activation='gelu',
+            dropout=0.1
         )
-        self.body = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(hidden_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(hidden_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(hidden_channels),
-            nn.SiLU(inplace=True),
-        )
-        self.attn = LightweightSpatialAttention(hidden_channels, num_heads=attn_heads)
-        self.tail = nn.Conv2d(hidden_channels, in_channels, kernel_size=3, padding=1)
-        nn.init.zeros_(self.tail.weight)
-        nn.init.zeros_(self.tail.bias)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 5. 预测头 (Regression Head)
+        self.regression_head = nn.Linear(d_model, 1)
+        
+        self.norm = nn.LayerNorm(d_model)
 
-        gate_mid = max(8, hidden_channels // 2)
-        self.post_gate = nn.Sequential(
-            nn.Conv2d(in_channels * 3, gate_mid, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(gate_mid),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(gate_mid, gate_mid, kernel_size=3, padding=1),
-            nn.InstanceNorm2d(gate_mid),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(gate_mid, in_channels, kernel_size=1, padding=0),
-        )
+    def forward(self, x):
+        # Input x: (B, 768, 28, 28)
+        B, C, H, W = x.shape
+        
+        # 1. 序列化 (Flatten & Permute): (B, 768, 784) -> (B, 784, 768)
+        x = x.flatten(2).transpose(1, 2)
+        
+        # 2. 线性降维 (Projection): (B, 784, 256)
+        x = self.input_proj(x)
+        
+        # 3. 位置编码 (Positional Encoding)
+        x = x + self.pos_embed
+        x = self.norm(x)
+        
+        # 4. 自注意力特征提取 (Transformer Encoder)
+        x = self.transformer(x)
+        
+        # 5. 预测头 (Regression Head): (B, 784, 1)
+        x = self.regression_head(x)
+        
+        # 6. 空间重构与激活 (Reshape & Activation)
+        # (B, 784, 1) -> (B, 1, 28, 28)
+        x = x.transpose(1, 2).reshape(B, 1, H, W)
+        
+        # Sigmoid 激活到 [0, 1]
+        output = torch.sigmoid(x)
+        
+        return output
 
-        # Start with near-identity behavior: G ~= 0, so output ~= Y.
-        nn.init.zeros_(self.post_gate[-1].weight)
-        nn.init.constant_(self.post_gate[-1].bias, -4.0)
+class AttentionCompoundLoss(nn.Module):
+    """Compound Loss: L1 + alpha * Soft Dice."""
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.l1_loss = nn.L1Loss()
+        self.epsilon = 1e-5
 
-    def forward(self, attn_map):
-        feat = self.head(attn_map)
-        feat = self.body(feat)
-        feat = feat + self.attn(feat)
-        delta = self.tail(feat)
-        y = attn_map + delta
+    def soft_dice_loss(self, preds, targets):
+        batch_size = preds.size(0)
+        p = preds.view(batch_size, -1)
+        t = targets.view(batch_size, -1)
+        
+        intersection = torch.sum(p * t, dim=1)
+        cardinality = torch.sum(p**2 + t**2, dim=1)
+        
+        dice_score = (2. * intersection + self.epsilon) / (cardinality + self.epsilon)
+        return 1.0 - dice_score.mean()
 
-        gate_in = torch.cat([attn_map, delta, delta.abs()], dim=1)
-        g = torch.sigmoid(self.post_gate(gate_in))
-        return (1.0 - g) * y
+    def forward(self, preds, targets):
+        l1 = self.l1_loss(preds, targets)
+        dice = self.soft_dice_loss(preds, targets)
+        total = l1 + self.alpha * dice
+        return total, l1, dice

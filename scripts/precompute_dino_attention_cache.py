@@ -50,6 +50,32 @@ def cache_file_path(cache_dir, rel_root, image_path):
     return os.path.join(cache_dir, rel + ".pt")
 
 
+def atomic_torch_save(obj, save_path):
+    """Write a torch object atomically and fall back to legacy serialization if needed."""
+    save_dir = os.path.dirname(save_path)
+    os.makedirs(save_dir, exist_ok=True)
+
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(dir=save_dir, prefix=".tmp_", suffix=".pth")
+    os.close(fd)
+    try:
+        try:
+            torch.save(obj, tmp_path)
+        except Exception as first_exc:
+            try:
+                torch.save(obj, tmp_path, _use_new_zipfile_serialization=False)
+            except Exception:
+                raise first_exc
+        os.replace(tmp_path, save_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Precompute DINO attention cache (.pt per image)")
     parser.add_argument("--dataroot", required=True, help="dataset root containing trainA/trainB/valA/valB/testA/testB")
@@ -100,7 +126,7 @@ def main():
                 if (not args.overwrite) and os.path.exists(out_path):
                     continue
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                torch.save(
+                atomic_torch_save(
                     {
                         "attn_map": attn_map[idx].detach().cpu(),
                         "cls_attn": cls_attn[idx].detach().cpu(),

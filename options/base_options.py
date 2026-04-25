@@ -1,5 +1,18 @@
 import argparse
 import os
+
+
+def _set_temporary_directory_fallback():
+    """Prefer a writable temp dir with space when the default disk-backed paths are full."""
+    fallback_tmp = "/dev/shm"
+    if os.path.isdir(fallback_tmp) and os.access(fallback_tmp, os.W_OK):
+        os.environ.setdefault("TMPDIR", fallback_tmp)
+        os.environ.setdefault("TEMP", fallback_tmp)
+        os.environ.setdefault("TMP", fallback_tmp)
+
+
+_set_temporary_directory_fallback()
+
 from util import util
 import torch
 import models

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import os
 import torch_fidelity
 import glob
@@ -109,7 +110,8 @@ def eval_val_metrics(model, src_loader, tgt_loader, lpips_fn=None):
     """Compute PSNR, SSIM, LPIPS on paired validation set.
 
     Args:
-        model: model with translate(x) method
+        model: model with translate(x) method; if it also exposes extract_attention(x),
+               metrics are computed on paired attention maps rather than raw images.
         src_loader: source domain DataLoader (input to translate)
         tgt_loader: target domain DataLoader (ground truth)
         lpips_fn: pre-initialized lpips.LPIPS model (optional)
@@ -118,20 +120,48 @@ def eval_val_metrics(model, src_loader, tgt_loader, lpips_fn=None):
 
     psnr_list, ssim_list, lpips_list = [], [], []
 
+    is_phi_eval = getattr(model, "is_phi_pretrain_stage", False)
+
     for src_data, tgt_data in zip(src_loader, tgt_loader):
         src_img = src_data['A'].cuda()
         tgt_img = tgt_data['A'].cuda()
 
-        fake_img = model.translate(src_img)  # [-1, 1]
+        if is_phi_eval:
+            # --- Phi-only Evaluation Logic (Attention Map PSNR) ---
+            # Extract source features and predict with Transformer
+            _, _, feat_src = model._extract_attention_features(src_img)
+            # Output is [B, 1, 28, 28] in [0, 1] range (sigmoid)
+            fake_img = model.netPhi(feat_src)
+            
+            # Get Ground Truth CT Attention
+            tgt_img_map, _ = model.dino_extractor(tgt_img, return_cls_attn=True)
+            # Normalize GT to [0, 1] for fair PSNR
+            tgt_img = model._normalize_struct_features(tgt_img_map)
+            
+            # Use native 28x28 resolution for evaluation (matching loss)
+            fake_eval = fake_img * 2.0 - 1.0
+            tgt_eval = tgt_img * 2.0 - 1.0
+        else:
+            # --- Standard Image Translation Evaluation ---
+            fake_eval = model.translate(src_img)  # [-1, 1]
+            if hasattr(model, "extract_attention"):
+                tgt_eval = model.extract_attention(tgt_img)  # [-1, 1]
+            else:
+                tgt_eval = tgt_img
 
         # LPIPS (expects [-1, 1])
         if lpips_fn is not None:
-            lpips_val = lpips_fn(fake_img, tgt_img).item()
+            if fake_eval.shape[-2:] != (224, 224):
+                lpips_input_fake = F.interpolate(fake_eval, size=(224, 224), mode='bilinear', align_corners=False)
+                lpips_input_tgt = F.interpolate(tgt_eval, size=(224, 224), mode='bilinear', align_corners=False)
+            else:
+                lpips_input_fake, lpips_input_tgt = fake_eval, tgt_eval
+            lpips_val = lpips_fn(lpips_input_fake, lpips_input_tgt).item()
             lpips_list.append(lpips_val)
 
         # Convert to [0, 255] uint8 numpy for PSNR / SSIM
-        fake_np = ((fake_img[0].cpu().clamp(-1, 1).float() + 1) / 2 * 255).numpy().transpose(1, 2, 0).astype(np.uint8)
-        tgt_np  = ((tgt_img[0].cpu().clamp(-1, 1).float() + 1) / 2 * 255).numpy().transpose(1, 2, 0).astype(np.uint8)
+        fake_np = ((fake_eval[0].cpu().clamp(-1, 1).float() + 1) / 2 * 255).numpy().transpose(1, 2, 0).astype(np.uint8)
+        tgt_np  = ((tgt_eval[0].cpu().clamp(-1, 1).float() + 1) / 2 * 255).numpy().transpose(1, 2, 0).astype(np.uint8)
 
         # PSNR
         mse = np.mean((fake_np.astype(np.float64) - tgt_np.astype(np.float64)) ** 2)
