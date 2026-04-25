@@ -266,10 +266,14 @@ class DualVelocityStructModel(BaseModel):
                 help="weight for cosine term in Phi supervision")
         parser.add_argument("--lambda_phi_l1", type=float, default=1.0,
                 help="weight for L1 term in Phi supervision")
+        parser.add_argument("--lambda_phi_dice", type=float, default=0.0,
+                help="weight for Soft Dice term in Phi supervision")
         parser.add_argument("--v0_stopgrad_phi", type=util.str2bool, nargs="?", const=True, default=True,
                             help="stop gradients to net_A when computing distilled V0 labels")
         parser.add_argument("--phi_hidden_channels", type=int, default=32,
-                            help="hidden channels for the MRI-to-CT attention mapper phi")
+                            help="hidden channels for the MRI-to-CT attention mapper phi (d_model for transformer)")
+        parser.add_argument("--phi_num_layers", type=int, default=4,
+                            help="number of transformer layers for AttentionPhi")
         parser.add_argument("--phi_pretrain_epochs", type=int, default=5,
                             help="legacy alias for max phi pretrain epochs before warmup")
         parser.add_argument("--phi_pretrain_max_epochs", type=int, default=None,
@@ -350,6 +354,7 @@ class DualVelocityStructModel(BaseModel):
             "G_v0_match",
             "G_phi_main",
             "G_phi_l1",
+            "G_phi_dice",
             "G_phi_kl",
             "G_phi_cos",
             "G_phi_fm_mse",
@@ -410,8 +415,13 @@ class DualVelocityStructModel(BaseModel):
             self.gpu_ids,
         )
         phi_in_channels = 1 if self.phi_input_domain == "attention" else (1 + self.phi_feature_dim)
+        phi_num_layers = int(getattr(opt, "phi_num_layers", 4))
         self.netPhi = networks.init_net(
-            AttentionPhi(in_channels=phi_in_channels, hidden_channels=max(8, int(opt.phi_hidden_channels)), out_channels=1),
+            AttentionPhi(
+                in_channels=phi_in_channels,
+                d_model=max(8, int(opt.phi_hidden_channels)),
+                num_layers=phi_num_layers
+            ),
             opt.init_type,
             opt.init_gain,
             self.gpu_ids,
@@ -731,6 +741,16 @@ class DualVelocityStructModel(BaseModel):
         pred_norm = self._normalize_struct_features(pred_map)
         target_norm = self._normalize_struct_features(target_map)
         loss_l1 = F.l1_loss(pred_norm, target_norm)
+
+        # Soft Dice Loss
+        batch_size = pred_norm.size(0)
+        p = pred_norm.view(batch_size, -1)
+        t = target_norm.view(batch_size, -1)
+        intersection = torch.sum(p * t, dim=1)
+        cardinality = torch.sum(p**2 + t**2, dim=1)
+        dice_score = (2. * intersection + 1e-5) / (cardinality + 1e-5)
+        loss_dice = 1.0 - dice_score.mean()
+
         loss_cos = (1.0 - F.cosine_similarity(pred_norm.flatten(1), target_norm.flatten(1), dim=1, eps=1e-8)).mean()
         loss_kl = self._compute_phi_kl_loss(pred_map, target_cls)
         _ = self._compute_phi_clip_loss(pred_map, target_cls, patient_ids, slice_indices)
@@ -738,19 +758,20 @@ class DualVelocityStructModel(BaseModel):
         lambda_kl = float(getattr(self.opt, "lambda_phi_kl", 1.0))
         lambda_cos = float(getattr(self.opt, "lambda_phi_cos", 1.0))
         lambda_l1 = float(getattr(self.opt, "lambda_phi_l1", 1.0))
+        lambda_dice = float(getattr(self.opt, "lambda_phi_dice", 0.0))
 
         mode = str(getattr(self.opt, "phi_loss_mode", "kl_cos_l1"))
         if mode in {"kl_cos_l1", "kl_clip"}:
-            main_loss = lambda_kl * loss_kl + lambda_cos * loss_cos + lambda_l1 * loss_l1
+            main_loss = lambda_kl * loss_kl + lambda_cos * loss_cos + lambda_l1 * loss_l1 + lambda_dice * loss_dice
         elif mode == "kl":
-            main_loss = lambda_kl * loss_kl
+            main_loss = lambda_kl * loss_kl + lambda_dice * loss_dice
         elif mode == "clip":
-            main_loss = lambda_cos * loss_cos
+            main_loss = lambda_cos * loss_cos + lambda_dice * loss_dice
         else:
             raise ValueError(f"Unsupported phi_loss_mode: {mode}")
 
         total_loss = main_loss
-        return total_loss, main_loss, loss_l1, loss_kl, loss_cos
+        return total_loss, main_loss, loss_l1, loss_kl, loss_cos, loss_dice
 
     def _phi_build_input(self, attn_xt, cond_feature_map=None):
         if self.phi_input_domain != "feature":
@@ -920,6 +941,7 @@ class DualVelocityStructModel(BaseModel):
         self.loss_G_v0_match = zero
         self.loss_G_phi_main = zero
         self.loss_G_phi_l1 = zero
+        self.loss_G_phi_dice = zero
         self.loss_G_phi_kl = zero
         self.loss_G_phi_cos = zero
         self.loss_G_phi_fm_mse = zero
@@ -1219,7 +1241,7 @@ class DualVelocityStructModel(BaseModel):
                 param.requires_grad = flag
         return v0.detach()
 
-    def _record_phi_epoch_metrics(self, main_loss, l1_loss, kl_loss, cos_loss):
+    def _record_phi_epoch_metrics(self, main_loss, l1_loss, kl_loss, cos_loss, dice_loss=None):
         main_val = float(main_loss.item())
         l1_val = float(l1_loss.item())
         kl_val = float(kl_loss.item())
@@ -1238,6 +1260,9 @@ class DualVelocityStructModel(BaseModel):
         self.phi_epoch_l1_loss = l1_val if self.phi_epoch_l1_loss is None else (0.5 * self.phi_epoch_l1_loss + 0.5 * l1_val)
         self.phi_epoch_kl_loss = kl_val if self.phi_epoch_kl_loss is None else (0.5 * self.phi_epoch_kl_loss + 0.5 * kl_val)
         self.phi_epoch_cos_loss = cos_val if self.phi_epoch_cos_loss is None else (0.5 * self.phi_epoch_cos_loss + 0.5 * cos_val)
+        if dice_loss is not None:
+            dice_val = float(dice_loss.item())
+            self.phi_epoch_dice_loss = dice_val if getattr(self, "phi_epoch_dice_loss", None) is None else (0.5 * self.phi_epoch_dice_loss + 0.5 * dice_val)
 
     def _phi_pretrain_step(self, images_A, images_B, patient_ids, slice_indices, image_paths_A=None, image_paths_B=None):
         if not self.isTrain:
@@ -1283,7 +1308,7 @@ class DualVelocityStructModel(BaseModel):
         else:
             attn_mri_map = self._apply_phi_condition(attn_mri_map, images_A)
             pred_ct = self.netPhi(self._phi_build_input(attn_mri_map, cond_feature_map=feat_mri_map))
-            total_loss, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
+            total_loss, main_loss, loss_l1, loss_kl, loss_cos, loss_dice = self._compute_phi_supervision_losses(
                 pred_ct,
                 attn_ct_map,
                 attn_ct_cls,
@@ -1301,11 +1326,12 @@ class DualVelocityStructModel(BaseModel):
                 phi_params.extend(group["params"])
             torch.nn.utils.clip_grad_norm_(phi_params, max_norm=self.phi_grad_clip_norm)
         self.optimizer_Phi.step()
-        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach())
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach(), dice_loss=loss_dice.detach())
         self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), patient_ids, slice_indices)
 
         self.loss_G_phi_main = main_loss.detach()
         self.loss_G_phi_l1 = loss_l1.detach()
+        self.loss_G_phi_dice = loss_dice.detach()
         self.loss_G_phi_kl = loss_kl.detach()
         self.loss_G_phi_cos = loss_cos.detach()
         return total_loss.detach()
@@ -1527,7 +1553,7 @@ class DualVelocityStructModel(BaseModel):
             latent_A, latent_B, _ = self._encode_latents(images_A, images_B, use_noise=False)
             ref_attn = self._predict_target_attention(images_A, detach=True, image_paths=pair_paths_A)
             attn_ct_map, attn_ct_cls, _ = self._extract_attention_features(images_B, image_paths=pair_paths_B)
-        loss_phi_pair, main_loss, loss_l1, loss_kl, loss_cos = self._compute_phi_supervision_losses(
+        loss_phi_pair, main_loss, loss_l1, loss_kl, loss_cos, loss_dice = self._compute_phi_supervision_losses(
             ref_attn,
             attn_ct_map,
             attn_ct_cls,
@@ -1571,9 +1597,10 @@ class DualVelocityStructModel(BaseModel):
 
         self.loss_G_phi_main = main_loss.detach()
         self.loss_G_phi_l1 = loss_l1.detach()
+        self.loss_G_phi_dice = loss_dice.detach()
         self.loss_G_phi_kl = loss_kl.detach()
         self.loss_G_phi_cos = loss_cos.detach()
-        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach())
+        self._record_phi_epoch_metrics(main_loss.detach(), loss_l1.detach(), loss_kl.detach(), loss_cos.detach(), dice_loss=loss_dice.detach())
         self._update_phi_clip_queue(self._sum_normalize_attention(attn_ct_cls), pair_patient_ids, pair_slice_indices)
 
         logged_pair = torch.zeros_like(loss_pair) if bool(getattr(self.opt, "force_unpaired", False)) else loss_pair.detach()
