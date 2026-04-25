@@ -129,18 +129,33 @@ def eval_val_metrics(model, src_loader, tgt_loader, lpips_fn=None):
         if is_phi_eval:
             # --- Phi-only Evaluation Logic (Attention Map PSNR) ---
             # Extract source features and predict with Transformer
-            _, _, feat_src = model._extract_attention_features(src_img)
+            phi_in_domain = str(getattr(model.opt, "phi_input_domain", "attention")).strip().lower()
+            out_src = model._extract_attention_features(src_img)
+            # _extract_attention_features returns (attn, cls, feat) or (attn, cls) or (attn, feat) depending on flags
+            # In DualVelocityStructModel, it returns (attn, cls, feat) if phi_input_domain="feature"
+            # otherwise (attn, cls, None).
+            attn_src = out_src[0]
+            cls_src = out_src[1]
+            feat_src = out_src[2] if len(out_src) > 2 else None
+
+            # Input for Phi branch
+            if phi_in_domain == "feature":
+                phi_input = model._phi_build_input(attn_src, cond_feature_map=feat_src)
+            else:
+                phi_input = attn_src
+
             # Output is [B, 1, 28, 28] in [0, 1] range (sigmoid)
-            fake_img = model.netPhi(feat_src)
+            fake_img = model.netPhi(phi_input)
             
             # Get Ground Truth CT Attention
-            tgt_img_map, _ = model.dino_extractor(tgt_img, return_cls_attn=True)
+            out_tgt = model.dino_extractor(tgt_img, return_cls_attn=True)
+            tgt_img_map = out_tgt[0]
             # Normalize GT to [0, 1] for fair PSNR
-            tgt_img = model._normalize_struct_features(tgt_img_map)
+            tgt_img_norm = model._normalize_struct_features(tgt_img_map)
             
             # Use native 28x28 resolution for evaluation (matching loss)
             fake_eval = fake_img * 2.0 - 1.0
-            tgt_eval = tgt_img * 2.0 - 1.0
+            tgt_eval = tgt_img_norm * 2.0 - 1.0
         else:
             # --- Standard Image Translation Evaluation ---
             fake_eval = model.translate(src_img)  # [-1, 1]
