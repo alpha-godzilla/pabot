@@ -7,6 +7,7 @@ import numpy as np
 import torch.utils.data as data
 from PIL import Image
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 from abc import ABC, abstractmethod
 
@@ -244,3 +245,63 @@ def __print_size_warning(ow, oh, w, h):
               "(%d, %d). This adjustment will be done to all images "
               "whose sizes are not multiples of 4" % (ow, oh, w, h))
         __print_size_warning.has_printed = True
+
+def get_geometric_params(opt):
+    """
+    Generate parameters for synchronous geometric transformation.
+    - Rotation: +/- 15 degrees
+    - Translation: +/- 10% of size
+    - Scale: 0.9 to 1.1
+    - Flip: 50% probability
+    """
+    angle = random.uniform(-15, 15)
+    
+    # Translation as fraction of image size
+    tx = random.uniform(-0.1, 0.1)
+    ty = random.uniform(-0.1, 0.1)
+    
+    scale = random.uniform(0.9, 1.1)
+    
+    flip = random.random() > 0.5
+    
+    return {
+        'angle': angle,
+        'shift': (tx, ty),
+        'scale': scale,
+        'flip': flip
+    }
+
+
+def apply_geometric_transform(img, params, opt, method=Image.BICUBIC):
+    """
+    Apply synchronized geometric transformation to a PIL image.
+    """
+    # 1. Resize to load_size first if needed (standardize)
+    if 'resize' in opt.preprocess or 'resize_and_crop' in opt.preprocess:
+        img = TF.resize(img, [opt.load_size, opt.load_size], interpolation=__to_interpolation_mode(method))
+    
+    # 2. Horizontal Flip
+    if not opt.no_flip and params['flip']:
+        img = TF.hflip(img)
+        
+    # 3. Affine: Rotation, Translation, Scale
+    w, h = img.size
+    max_dx = params['shift'][0] * w
+    max_dy = params['shift'][1] * h
+    
+    img = TF.affine(
+        img, 
+        angle=params['angle'], 
+        translate=[max_dx, max_dy], 
+        scale=params['scale'], 
+        shear=0,
+        interpolation=__to_interpolation_mode(method),
+        fill=0
+    )
+    
+    # 4. Final Crop to crop_size
+    if 'crop' in opt.preprocess or 'resize_and_crop' in opt.preprocess:
+        # Use center crop to maintain geometric consistency after affine
+        img = TF.center_crop(img, [opt.crop_size, opt.crop_size])
+    
+    return img

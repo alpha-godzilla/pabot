@@ -1,7 +1,8 @@
 import os.path
-from data.base_dataset import BaseDataset, get_transform
+from data.base_dataset import BaseDataset, get_transform, get_geometric_params, apply_geometric_transform
 from data.image_folder import make_dataset
 from PIL import Image
+import torchvision.transforms as transforms
 import random
 import os
 import re
@@ -119,13 +120,29 @@ class UnalignedDataset(BaseDataset):
         
 
         # Apply image transformation
-        # For CUT/FastCUT mode, if in finetuning phase (learning rate is decaying),
-        # do not perform resize-crop data augmentation of CycleGAN.
-        is_finetuning = self.opt.isTrain and self.current_epoch > self.opt.n_epochs
-        modified_opt = util.copyconf(self.opt, load_size=self.opt.crop_size if is_finetuning else self.opt.load_size)
-        transform = get_transform(modified_opt)
-        A = transform(A_img)
-        B = transform(B_img)
+        if is_paired:
+            # Synchronous Geometric Augmentation
+            params = get_geometric_params(self.opt)
+            A_img = apply_geometric_transform(A_img, params, self.opt)
+            B_img = apply_geometric_transform(B_img, params, self.opt)
+            
+            # Post-processing: ToTensor and Normalize [-1, 1]
+            # (Matches standard pix2pix/cyclegan normalization)
+            post_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            ])
+            A = post_transform(A_img)
+            B = post_transform(B_img)
+        else:
+            # Independent Random Augmentation (Standard logic)
+            # For CUT/FastCUT mode, if in finetuning phase (learning rate is decaying),
+            # do not perform resize-crop data augmentation of CycleGAN.
+            is_finetuning = self.opt.isTrain and self.current_epoch > self.opt.n_epochs
+            modified_opt = util.copyconf(self.opt, load_size=self.opt.crop_size if is_finetuning else self.opt.load_size)
+            transform = get_transform(modified_opt)
+            A = transform(A_img)
+            B = transform(B_img)
 
         return {
             'A': A,
