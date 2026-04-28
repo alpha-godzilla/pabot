@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--cache_dir", required=True, help="output cache directory")
     parser.add_argument("--splits", default="trainA,trainB,valA,valB,testA,testB", help="comma-separated splits to process")
     parser.add_argument("--dino_model_name", default="dino_vitb8")
-    parser.add_argument("--dino_image_size", type=int, default=224)
+    parser.add_argument("--dino_image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--gpu_id", type=int, default=0)

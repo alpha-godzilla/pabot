@@ -101,9 +101,10 @@ class LatentStructUNet(nn.Module):
 class LatentVelocityNet(nn.Module):
     """Time-conditioned latent velocity predictor v_gen(c_t, t)."""
 
-    def __init__(self, in_channels, hidden_channels=128, time_dim=64):
+    def __init__(self, in_channels, hidden_channels=128, time_dim=64, num_heads=1):
         super().__init__()
         self.time_dim = time_dim
+        self.num_heads = num_heads
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, hidden_channels),
             nn.SiLU(inplace=True),
@@ -120,7 +121,11 @@ class LatentVelocityNet(nn.Module):
             nn.InstanceNorm2d(hidden_channels),
             nn.SiLU(inplace=True),
         )
-        self.out_proj = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
+        if num_heads == 1:
+            self.out_proj = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
+        else:
+            self.out_proj1 = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
+            self.out_proj2 = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
 
     def _time_embedding(self, t):
         half = self.time_dim // 2
@@ -138,7 +143,10 @@ class LatentVelocityNet(nn.Module):
         temb = self.time_mlp(self._time_embedding(t)).unsqueeze(-1).unsqueeze(-1)
         x = x + temb
         x = self.body(x)
-        return self.out_proj(x)
+        if self.num_heads == 1:
+            return self.out_proj(x)
+        else:
+            return self.out_proj1(x), self.out_proj2(x)
 
 
 class DualVelocityModel(BaseModel):

@@ -310,7 +310,7 @@ def main() -> int:
     parser.add_argument("--a_vit_heads", type=int, default=8)
     parser.add_argument("--a_vit_patch", type=int, default=2)
     parser.add_argument("--dino_model_name", default="dino_vitb8")
-    parser.add_argument("--dino_image_size", type=int, default=224)
+    parser.add_argument("--dino_image_size", type=int, default=256)
     parser.add_argument("--input_nc", type=int, default=3)
     parser.add_argument("--output_nc", type=int, default=3)
     parser.add_argument("--ngf", type=int, default=64)
