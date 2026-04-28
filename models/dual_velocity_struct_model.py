@@ -975,6 +975,7 @@ class DualVelocityStructModel(BaseModel):
         self.loss_G_phi_fm_xt_noise = zero
         self.loss_G_phi_pair = zero
         self.loss_G_vg_attn = zero
+        self.loss_G_gated_ortho = zero
         self.loss_G_phase_gen = zero
         self.loss_G_phase_vstruct = zero
         self.loss_G_phase_sync = zero
